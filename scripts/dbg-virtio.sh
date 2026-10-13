@@ -27,5 +27,5 @@ sleep 3
 python3 scripts/dbg-qmp.py
 echo "--- qemu stderr tail ---"
 tail -5 build/qemu-qmp-stderr.log 2>/dev/null || true
-kill "${Q_PID:-0}" 2>/dev/null || true
+if [ -n "${Q_PID:-}" ]; then kill "$Q_PID" 2>/dev/null || true; fi
 taskkill //F //IM qemu-system-x86_64.exe >/dev/null 2>&1 || true

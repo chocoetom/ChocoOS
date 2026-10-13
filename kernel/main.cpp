@@ -83,6 +83,7 @@ extern "C" void kmain() {
 
     choco::sched::init();
     choco::shell::start_workers();
+    choco::net::dhcp::start();  // background handshake, never blocks boot
     choco::gui::init(); // desktop takes over the console surface
     choco::sched::set_started(true);
     choco::cpu::sti();

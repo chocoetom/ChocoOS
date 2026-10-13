@@ -1,7 +1,45 @@
 #!/usr/bin/env python3
-# Minimal pcap reader: prints linktype + per-packet ethertype/IP summary.
+# Minimal pcap reader: prints linktype + per-packet ethertype/IP summary,
+# with UDP and DHCP (ports 67/68) decoding for the net-2 DHCP test.
 import struct
 import sys
+
+DHCP_TYPES = {1: "discover", 2: "offer", 3: "request", 4: "decline",
+              5: "ack", 6: "nak", 7: "release", 8: "inform"}
+
+
+def decode_dhcp(udp, out):
+    # udp: full UDP datagram bytes. Returns "dhcp <type> ..." or "".
+    if len(udp) < 240:
+        return ""
+    if udp[236:240] != bytes([99, 130, 83, 99]):
+        return ""
+    op = udp[0]
+    xid = struct.unpack(">I", udp[4:8])[0]
+    yiaddr = ".".join(str(b) for b in udp[16:20])
+    msg, server = 0, ""
+    p = 240
+    while p < len(udp):
+        tag = udp[p]
+        p += 1
+        if tag == 0:
+            continue
+        if tag == 255:
+            break
+        if p >= len(udp):
+            break
+        ln = udp[p]
+        p += 1
+        if p + ln > len(udp):
+            break
+        if tag == 53 and ln == 1:
+            msg = udp[p]
+        if tag == 54 and ln == 4:
+            server = ".".join(str(b) for b in udp[p:p + 4])
+        p += ln
+    kind = DHCP_TYPES.get(msg, f"type{msg}")
+    return f"dhcp {kind} op={op} xid={xid:08x} yiaddr={yiaddr} server={server}"
+
 
 path = sys.argv[1] if len(sys.argv) > 1 else "build/dbg-trace.pcap"
 d = open(path, "rb").read()
@@ -36,5 +74,16 @@ while off + 16 <= len(d):
         extra = f"ip proto={proto} {sip}->{dip}"
         if proto == 1 and len(pkt) >= 42:
             extra += f" icmp type={pkt[34]} code={pkt[35]}"
+        if proto == 17 and len(pkt) >= 42:
+            sport = (pkt[34] << 8) | pkt[35]
+            dport = (pkt[36] << 8) | pkt[37]
+            ulen = (pkt[38] << 8) | pkt[39]
+            extra += f" udp {sport}->{dport} len={ulen}"
+            if (sport in (67, 68) or dport in (67, 68)) and ulen >= 248:
+                ud = pkt[34:34 + ulen]
+                if len(ud) >= 248:
+                    dd = decode_dhcp(ud[8:], extra)
+                    if dd:
+                        extra += f" {dd}"
     print(f"pkt{n} len={incl} {src}->{dst} et=0x{et:04x} {extra}")
 print(f"total {n} packets")

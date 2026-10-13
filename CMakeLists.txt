@@ -54,6 +54,8 @@ add_executable(chocoos.elf
   kernel/proc/vfs.cpp
   kernel/proc/fat32.cpp
   kernel/net/net.cpp
+  kernel/net/udp.cpp
+  kernel/net/dhcp.cpp
 )
 
 target_include_directories(chocoos.elf PRIVATE

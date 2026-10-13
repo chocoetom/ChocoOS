@@ -24,9 +24,13 @@ sk() {
   esac
 }
 
+# NOTE: ioeventfd=off forces synchronous MMIO doorbells. With the default
+# ioeventfd, kicks go through host eventfds; on this Windows QEMU build a
+# kick to a dead backend (link down / no peer) stalls the vCPU forever.
+# The MR path always returns, so TX timeouts stay guest-side and bounded.
 coproc Q { exec qemu-system-x86_64 -cdrom "$ISO" -m 256M -display none \
   -accel tcg,tb-size=64 -serial file:"$LOG" -boot order=d -no-reboot \
-  -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+  -netdev user,id=n0 -device virtio-net-pci,netdev=n0,ioeventfd=off \
   -object filter-dump,id=dump0,netdev=n0,file="$PCAP" \
   -monitor stdio >/dev/null 2>&1; }
 
@@ -53,6 +57,8 @@ type_line "pci"
 type_line "ifconfig"
 type_line "arp"
 type_line "ping 10.0.2.2 2"
+type_line "arp flush"
+type_line "ping 10.0.2.2 1"
 type_line "arp"
 sleep 2
 printf 'quit\n' >&"${Q[1]}" 2>/dev/null || true
@@ -92,6 +98,8 @@ if [ -f "$PCAP" ]; then
     fi
   else
     python3 scripts/pcap.py "$PCAP"
+    # The post-flush ping forces a fresh on-wire ARP exchange (the gateway
+    # MAC is otherwise already known via snooping on the DHCP offer).
     if python3 scripts/pcap.py "$PCAP" 2>/dev/null | grep -q "arp op=1"; then
       echo "PASS: pcap has ARP request"; pass=$((pass + 1))
     else

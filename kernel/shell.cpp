@@ -108,7 +108,9 @@ void c_help(int, char **) {
         "  ifconfig             show MAC/IP/gateway/net stats",
         "  ping <ip> [n]        ICMP echo to IPv4 (try 'ping 10.0.2.2')",
         "  arp                  show ARP table",
-        "  dns <name>           (net-3 todo: needs UDP first)",
+        "  dhcp [renew]         DHCP status (renews in background)",
+        "  udpstat              UDP sockets and counters",
+        "  dns <name>           (net-3 todo: needs DNS over UDP)",
     };
     con::println("commands:", ACC);
     for (auto *ln : kLines) con::println(ln);
@@ -214,6 +216,58 @@ void c_wintest(int, char **) {
     bool ok = (x1 == x0 + 100) && (y1 == y0 + 80);
     con::kprintf(ok ? OK : ERR, BG, "[wintest] term now at %d,%d: %s\n",
                  x1, y1, ok ? "PASS (drag works)" : "FAIL");
+
+    // Resize: grab the right edge and drag it 60px outward.
+    int w0 = 0, h0 = 0;
+    gui::term_size(w0, h0);
+    const int ex = x1 + w0 - 1, ey = y1 + h0 / 2;
+    mouse::inject(ex, ey, 0);
+    gui::tick();
+    mouse::inject(ex, ey, 1);  // press on the border band
+    gui::tick();
+    for (int i = 1; i <= 3; i++) {
+        mouse::inject(ex + i * 20, ey, 1);
+        gui::tick();
+    }
+    mouse::inject(ex + 60, ey, 0);  // release
+    gui::tick();
+    int w1 = 0, h1 = 0;
+    gui::term_size(w1, h1);
+    const bool rok = (w1 == w0 + 60) && (h1 == h0);
+    con::kprintf(rok ? OK : ERR, BG, "[wintest] resize %dx%d -> %dx%d: %s\n", w0, h0, w1, h1,
+                 rok ? "PASS (edge drag)" : "FAIL");
+
+    // Maximize: double-click the caption.
+    const int cx = x1 + 100, cy = y1 + 10;
+    mouse::inject(cx, cy, 1);
+    gui::tick();
+    mouse::inject(cx, cy, 0);
+    gui::tick();
+    mouse::inject(cx, cy, 1);  // second press within the double-click window
+    gui::tick();
+    mouse::inject(cx, cy, 0);
+    gui::tick();
+    int wm = 0, hm = 0;
+    gui::term_size(wm, hm);
+    const bool mok = wm > w1 && hm > h1;
+    con::kprintf(mok ? OK : ERR, BG, "[wintest] maximize %dx%d -> %dx%d: %s\n", w1, h1, wm, hm,
+                 mok ? "PASS (caption double-click)" : "FAIL");
+
+    // Restore: a maximized window sits at 0,0, so its caption is there now.
+    mouse::inject(100, 10, 1);
+    gui::tick();
+    mouse::inject(100, 10, 0);
+    gui::tick();
+    mouse::inject(100, 10, 1);
+    gui::tick();
+    mouse::inject(100, 10, 0);
+    gui::tick();
+    int wr = 0, hr = 0, xr = 0, yr = 0;
+    gui::term_size(wr, hr);
+    gui::term_pos(xr, yr);
+    const bool rok2 = (wr == w1) && (hr == h1) && (xr == x1) && (yr == y1);
+    con::kprintf(rok2 ? OK : ERR, BG, "[wintest] restore to %dx%d at %d,%d: %s\n", w1, h1, xr, yr,
+                 rok2 ? "PASS (geometry round-trip)" : "FAIL");
 }
 
 void c_wallpaper(int argc, char **argv) {
@@ -311,7 +365,8 @@ void c_ifconfig(int, char **) {
     net::fmt_mac(net::mac(), mc);
     const auto &st = net::stats();
     con::kprintf(FG, BG, "mac %s link %s\n", mc, net::link_up() ? "up" : "down");
-    con::kprintf(FG, BG, "ip %s mask %s gw %s dns %s\n", ip, mk, gw, dn);
+    con::kprintf(FG, BG, "ip %s mask %s gw %s dns %s src %s dhcp %s\n", ip, mk, gw, dn,
+                 net::ip_source_str(), net::dhcp::state_str());
     con::kprintf(FG, BG, "rx %llu tx %llu drop %llu | arp rx %llu tx %llu | ip rx %llu tx %llu | icmp rx %llu tx %llu reply %llu\n",
                  st.rx, st.tx, st.dropped, st.arp_rx, st.arp_tx,
                  st.ip_rx, st.ip_tx, st.icmp_rx, st.icmp_tx, st.icmp_reply);
@@ -338,7 +393,12 @@ void c_ping(int argc, char **argv) {
     con::kprintf(got > 0 ? OK : ERR, BG, "[ping] %d/%llu replies\n", got, n);
 }
 
-void c_arp(int, char **) {
+void c_arp(int argc, char **argv) {
+    if (argc > 1 && !util::strcmp(argv[1], "flush")) {
+        net::arp_flush();
+        con::println("arp: table flushed", FG);
+        return;
+    }
     if (!net::ready()) { con::println("net: no NIC", ERR); return; }
     int n = net::arp_count();
     con::kprintf(FG, BG, "arp: %d entries\n", n);
@@ -355,7 +415,30 @@ void c_arp(int, char **) {
 
 void c_dns(int argc, char **) {
     (void)argc;
-    con::println("dns: todo in net-3 (needs UDP first). Try 'ping 10.0.2.2'.", FG);
+    con::println("dns: todo in net-3 (needs DNS over UDP). Try 'ping 10.0.2.2'.", FG);
+}
+
+void c_dhcp(int argc, char **argv) {
+    if (argc > 1 && !util::strcmp(argv[1], "renew")) {
+        if (net::dhcp::renew())
+            con::println("dhcp: renewal started (watch serial/log)", FG);
+        else
+            con::println("dhcp: a run is already active", ERR);
+        return;
+    }
+    char sip[16] = "-";
+    if (net::dhcp::server()) net::fmt_ipv4(net::dhcp::server(), sip);
+    char ips[16];
+    net::fmt_ipv4(net::ip(), ips);
+    con::kprintf(FG, BG, "dhcp: %s ip %s src %s server %s lease %u s\n",
+                 net::dhcp::state_str(), ips, net::ip_source_str(), sip,
+                 net::dhcp::lease_secs());
+}
+
+void c_udpstat(int, char **) {
+    const auto &st = net::udp::stats();
+    con::kprintf(FG, BG, "udp: socks %d rx %llu tx %llu drop %llu csum_err %llu\n",
+                 net::udp::socket_count(), st.rx, st.tx, st.dropped, st.csum_err);
 }
 
 void c_pci(int, char **) {
@@ -405,6 +488,8 @@ const Cmd kCmds[] = {
     {"ping", "ping an IPv4", c_ping},
     {"arp", "show ARP table", c_arp},
     {"dns", "resolve a name (todo)", c_dns},
+    {"dhcp", "DHCP status/renew", c_dhcp},
+    {"udpstat", "UDP stats", c_udpstat},
     {"pci", "list PCI devices", c_pci},
 };
 
