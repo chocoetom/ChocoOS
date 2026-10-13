@@ -101,7 +101,7 @@
 - [x] Entrada `syscall` de verdade: EFER.SCE + LSTAR + stub `kernel/cpu/linux.asm` (mesmo `cpu::Frame` do `isr.asm`, retorno via `iretq`, sem churn no GDT)
 - [x] Tradutor com ~35 syscalls (`linux_dispatch` em `kernel/proc/syscall.cpp`): read/write/readv/writev/openat/close/lseek/fstat, brk/mmap/munmap/mprotect, arch_prctl(SET_FS/GET_FS), uname, clock_gettime, getrandom, ioctl→ENOTTY, sinais/futex→stub, exit/exit_group
 - [x] Stack Linux: argc/argv/envp + auxv (PHDR/PHENT/PHNUM/ENTRY/UID/GID/CLKTCK/PAGESZ/RANDOM/EXECFN); `USTACK_PAGES` 8→16; `PT_TLS`/RELRO ignorados com segurança
-- [x] SSE/FPU ligado no boot (musl emite SSE2; kernel segue integer-only, sem save/restore por enquanto)
+- [x] SSE/FPU ligado no boot (musl emite SSE2; kernel segue integer-only). **Contexto de FPU/SSE por thread** (2026-10-13): `Thread.fpu[512]` (FXSAVE) salvo/restaurado em `do_switch` e baseline limpo no `thread_trampoline` — sem isso, dois threads com float compartilhavam o FPU e corrompiam um ao outro após uma preempção. Teste `bin/lfpu` (soma float no pai enquanto um clone martela os XMM; falha se o FPU não for por thread).
 - [x] Sysroot musl 1.2.5 via clang (`scripts/build-musl.sh`, cache em `build/musl-src`, `ar` com response file no Windows)
 - [x] Marco: `Hello from musl libc!` + exit 0 (`user/mhello.c` → `bin/mhello` estático de verdade); `lhello` + `ltest: PASS` (asm, sem libc)
 - [x] BusyBox estático Debian: `busybox true` exit 0, `busybox echo hi` imprime `hi`, `busybox uname -a` imprime `Linux choco 5.4.0 ...`.
