@@ -27,7 +27,7 @@ const uint8_t *mac();  // 6 bytes, nullptr when !ready
 uint32_t ip();         // current address (default until DHCP binds)
 uint32_t gw();
 uint32_t mask();
-uint32_t dns();
+uint32_t dns_server();
 
 // Send an IPv4 payload (proto: 1=ICMP, 6=TCP, 17=UDP). Resolves ARP, may
 // trigger an ARP request and drop the packet when the MAC is unknown.
@@ -101,5 +101,15 @@ uint32_t lease_secs();  // granted lease (0 when unknown)
 bool renew();           // restart discovery now; false when a run is active
 
 }  // namespace dhcp
+
+namespace dns {
+
+// DNS resolver (UDP/53, A records; see kernel/net/dns.cpp, bounds E1-E8).
+// Returns the number of IPv4 addresses stored (0..max_ips), or negative:
+// -1 timeout/no route, -2 bad name/args, -3 NXDOMAIN, -4 server failure,
+// -5 malformed response. Blocks up to timeout_ms total.
+int resolve(const char *name, uint32_t *out_ips, int max_ips, uint32_t timeout_ms);
+
+}  // namespace dns
 
 }  // namespace choco::net

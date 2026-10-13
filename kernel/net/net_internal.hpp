@@ -72,3 +72,9 @@ namespace choco::net {
 void apply_dhcp_config(uint32_t new_ip, uint32_t new_mask, uint32_t new_gw, uint32_t new_dns);
 void apply_fallback_config();
 }  // namespace choco::net
+
+namespace choco::net::internal {
+// Ensure the ARP entry for next_hop exists (request + bounded wait).
+// Returns true when resolved. Never holds the lock across poll().
+bool arp_resolve(uint32_t next_hop, uint32_t timeout_ms);
+}  // namespace choco::net::internal

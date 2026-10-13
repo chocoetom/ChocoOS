@@ -41,6 +41,80 @@ def decode_dhcp(udp, out):
     return f"dhcp {kind} op={op} xid={xid:08x} yiaddr={yiaddr} server={server}"
 
 
+def decode_dns_name(msg, pos):
+    # Returns (name, next_pos) or (None, pos) on bounds failure. Follows
+    # compression pointers with a jump cap (mirrors the kernel skip_name).
+    labels = []
+    jumps = 0
+    end = None  # linear position past the name (after 1st pointer/zero)
+    while True:
+        if pos >= len(msg):
+            return None, end if end is not None else pos
+        b = msg[pos]
+        if b == 0:
+            if end is None:
+                end = pos + 1
+            break
+        if (b & 0xC0) == 0xC0:
+            if pos + 1 >= len(msg):
+                return None, end if end is not None else pos
+            tgt = ((b & 0x3F) << 8) | msg[pos + 1]
+            if tgt >= len(msg):
+                return None, end if end is not None else pos
+            if end is None:
+                end = pos + 2
+            jumps += 1
+            if jumps > 8:
+                return None, end if end is not None else pos
+            pos = tgt
+            continue
+        if (b & 0xC0) or b > 63 or pos + 1 + b > len(msg):
+            return None, end if end is not None else pos
+        labels.append("".join(chr(c) for c in msg[pos + 1:pos + 1 + b]))
+        pos += 1 + b
+    return ".".join(labels), end
+
+
+def decode_dns(udp):
+    # udp: full UDP datagram. Returns "dns ..." summary or "".
+    if len(udp) < 12:
+        return ""
+    did = (udp[0] << 8) | udp[1]
+    flags = (udp[2] << 8) | udp[3]
+    qd = (udp[4] << 8) | udp[5]
+    an = (udp[6] << 8) | udp[7]
+    rcode = flags & 0xF
+    if flags & 0x8000:
+        kind = "resp"
+    else:
+        kind = "query"
+    pos = 12
+    qname = "?"
+    if qd > 0:
+        qname, pos = decode_dns_name(udp, pos)
+        if qname is None:
+            return ""
+        pos += 4
+    out = f"dns {kind} id={did:04x} rcode={rcode} q={qname} an={an}"
+    if an > 0 and flags & 0x8000:
+        ips = []
+        for _ in range(min(an, 8)):
+            nm, pos = decode_dns_name(udp, pos)
+            if nm is None or pos + 10 > len(udp):
+                break
+            rtype = (udp[pos] << 8) | udp[pos + 1]
+            rdlen = (udp[pos + 8] << 8) | udp[pos + 9]
+            pos += 10
+            if pos + rdlen > len(udp):
+                break
+            if rtype == 1 and rdlen == 4:
+                ips.append(".".join(str(b) for b in udp[pos:pos + 4]))
+            pos += rdlen
+        if ips:
+            out += " a=" + ",".join(ips)
+    return out
+
+
 path = sys.argv[1] if len(sys.argv) > 1 else "build/dbg-trace.pcap"
 d = open(path, "rb").read()
 if len(d) < 24:
@@ -79,11 +153,14 @@ while off + 16 <= len(d):
             dport = (pkt[36] << 8) | pkt[37]
             ulen = (pkt[38] << 8) | pkt[39]
             extra += f" udp {sport}->{dport} len={ulen}"
-            if (sport in (67, 68) or dport in (67, 68)) and ulen >= 248:
-                ud = pkt[34:34 + ulen]
-                if len(ud) >= 248:
-                    dd = decode_dhcp(ud[8:], extra)
-                    if dd:
-                        extra += f" {dd}"
+            ud = pkt[42:42 + max(0, ulen - 8)]
+            if {sport, dport} == {67, 68} and len(ud) >= 240:
+                dd = decode_dhcp(ud, extra)
+                if dd:
+                    extra += f" {dd}"
+            elif (sport == 53 or dport == 53) and len(ud) >= 12:
+                dd = decode_dns(ud)
+                if dd:
+                    extra += f" {dd}"
     print(f"pkt{n} len={incl} {src}->{dst} et=0x{et:04x} {extra}")
 print(f"total {n} packets")

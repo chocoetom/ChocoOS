@@ -110,7 +110,7 @@ void c_help(int, char **) {
         "  arp                  show ARP table",
         "  dhcp [renew]         DHCP status (renews in background)",
         "  udpstat              UDP sockets and counters",
-        "  dns <name>           (net-3 todo: needs DNS over UDP)",
+        "  dns <name>           resolve A records via UDP (try 'dns example.com')",
     };
     con::println("commands:", ACC);
     for (auto *ln : kLines) con::println(ln);
@@ -142,12 +142,74 @@ void c_uptime(int, char **) {
 
 void c_threads(int, char **) { sched::dump(); }
 
+// Regression test: a brand-new thread that sits in a tight spin must be
+// preempted by the PIT (needs sti in thread_trampoline) and a 1 ms sleep must
+// not round to zero ticks (needs sleep_ms rounding up). If either regresses,
+// the boot would hang here with only the first worker scheduled.
+struct SpinJob { volatile uint64_t ticks; };
+
+void spin_worker(void *arg) {
+    (void)arg;
+    uint64_t end = pit::ticks() + 20; // ~200 ms at 100 Hz
+    volatile uint64_t x = 0;
+    while ((int64_t)(pit::ticks() - end) < 0) {
+        x++; // tight loop, no yield on purpose
+        if ((x & 0xFFFFFFULL) == 0) sched::sleep_ms(1);
+    }
+    sched::exit();
+}
+
+void c_stress(int, char **) {
+    con::println("[stress] spawning tight-loop thread (200 ms)...", FG);
+    if (!sched::spawn("stress", spin_worker, nullptr)) {
+        con::println("[stress] FAIL: spawn refused", ERR);
+        return;
+    }
+    // If preemption and sleep_ms work, control returns here immediately and
+    // the shell keeps answering while the spinner runs to completion.
+    con::println("[stress] shell responsive while spinner runs - OK", OK);
+}
+
 void c_echo(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (i > 1) con::put_char(' ', FG, BG);
         con::print(argv[i], FG, BG);
     }
     con::put_char('\n', FG, BG);
+}
+
+// mkfile <path> <text...> - write text to a file (create or truncate).
+// Needed to exercise the writable layer without output redirection.
+void c_mkfile(int argc, char **argv) {
+    if (argc < 3) {
+        con::println("usage: mkfile <path> <text...>", ERR);
+        return;
+    }
+    // Join arguments into the payload, single-spaced.
+    char buf[256]{};
+    size_t n = 0;
+    for (int i = 2; i < argc && n < sizeof(buf) - 2; i++) {
+        if (i > 2) buf[n++] = ' ';
+        const char *s = argv[i];
+        while (*s && n < sizeof(buf) - 2) buf[n++] = *s++;
+    }
+    buf[n++] = '\n';
+    buf[n] = 0;
+    const uint8_t *data = nullptr;
+    size_t cap = 0;
+    long id = fs::writable_open(argv[1], true, true, &data, &cap);
+    if (id < 0) {
+        con::kprintf(ERR, BG, "mkfile: open failed (%ld)\n", id);
+        return;
+    }
+    size_t next = 0;
+    long w = fs::writable_write(id, 0, buf, n, false, &next);
+    if (w < 0) {
+        con::kprintf(ERR, BG, "mkfile: write failed (%ld)\n", w);
+        return;
+    }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "mkfile: %ld bytes -> %s\n", w, argv[1]);
 }
 
 void c_sleep(int argc, char **argv) {
@@ -361,7 +423,7 @@ void c_ifconfig(int, char **) {
     net::fmt_ipv4(net::ip(), ip);
     net::fmt_ipv4(net::gw(), gw);
     net::fmt_ipv4(net::mask(), mk);
-    net::fmt_ipv4(net::dns(), dn);
+    net::fmt_ipv4(net::dns_server(), dn);
     net::fmt_mac(net::mac(), mc);
     const auto &st = net::stats();
     con::kprintf(FG, BG, "mac %s link %s\n", mc, net::link_up() ? "up" : "down");
@@ -413,9 +475,37 @@ void c_arp(int argc, char **argv) {
     }
 }
 
-void c_dns(int argc, char **) {
-    (void)argc;
-    con::println("dns: todo in net-3 (needs DNS over UDP). Try 'ping 10.0.2.2'.", FG);
+void c_dns(int argc, char **argv) {
+    if (argc < 2) {
+        con::println("usage: dns <name>  (try 'dns example.com')", ERR);
+        return;
+    }
+    if (!net::ready()) {
+        con::println("net: no NIC", ERR);
+        return;
+    }
+    con::kprintf(FG, BG, "[dns] resolving '%s' ...\n", argv[1]);
+    uint32_t ips[4]{};
+    int rc = net::dns::resolve(argv[1], ips, 4, 6000);
+    if (rc > 0) {
+        for (int i = 0; i < rc; i++) {
+            char tmp[16];
+            net::fmt_ipv4(ips[i], tmp);
+            con::kprintf(OK, BG, "[dns] %s -> %s\n", argv[1], tmp);
+        }
+    } else if (rc == 0) {
+        con::kprintf(FG, BG, "[dns] %s: no A records\n", argv[1]);
+    } else if (rc == -3) {
+        con::kprintf(ERR, BG, "[dns] %s: NXDOMAIN\n", argv[1]);
+    } else if (rc == -2) {
+        con::kprintf(ERR, BG, "[dns] bad name '%s'\n", argv[1]);
+    } else if (rc == -4) {
+        con::kprintf(ERR, BG, "[dns] %s: server failure\n", argv[1]);
+    } else if (rc == -5) {
+        con::kprintf(ERR, BG, "[dns] %s: malformed response\n", argv[1]);
+    } else {
+        con::kprintf(ERR, BG, "[dns] %s: timeout\n", argv[1]);
+    }
 }
 
 void c_dhcp(int argc, char **argv) {
@@ -472,7 +562,9 @@ const Cmd kCmds[] = {
     {"mem", "memory summary", c_mem},
     {"uptime", "uptime", c_uptime},
     {"threads", "list threads", c_threads},
+    {"stress", "spawn tight-loop thread: preemption regression", c_stress},
     {"echo", "print arguments", c_echo},
+    {"mkfile", "mkfile <path> <text...> - write text to file", c_mkfile},
     {"sleep", "sleep N ms", c_sleep},
     {"choco", "black-cat wisdom", c_choco},
     {"reboot", "reboot the machine", c_reboot},
@@ -487,7 +579,7 @@ const Cmd kCmds[] = {
     {"ifconfig", "show net config", c_ifconfig},
     {"ping", "ping an IPv4", c_ping},
     {"arp", "show ARP table", c_arp},
-    {"dns", "resolve a name (todo)", c_dns},
+    {"dns", "resolve a name", c_dns},
     {"dhcp", "DHCP status/renew", c_dhcp},
     {"udpstat", "UDP stats", c_udpstat},
     {"pci", "list PCI devices", c_pci},

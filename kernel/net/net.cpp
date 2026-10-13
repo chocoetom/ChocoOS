@@ -318,7 +318,34 @@ void handle_frame(const uint8_t *frame, uint16_t len) {
         s_stats.dropped++;
 }
 
+// Shared ARP wait (used by ping's prelude and DNS). Runs inside the
+// anonymous namespace so it sees arp_lookup/arp_request directly.
+bool arp_resolve_impl(uint32_t next_hop, uint32_t timeout_ms) {
+    {
+        internal::Lock guard;
+        if (!arp_lookup(next_hop)) arp_request(next_hop);
+    }
+    uint64_t t0 = internal::now_ms();
+    for (;;) {
+        bool have = false;
+        {
+            internal::Lock guard;
+            have = arp_lookup(next_hop) != nullptr;
+        }
+        if (have || internal::now_ms() - t0 >= timeout_ms) return have;
+        // poll() takes its own lock; pause outside all locks.
+        poll();
+        for (int i = 0; i < 20000; i++) asm volatile("pause");
+    }
+}
+
 }  // namespace
+
+namespace internal {
+bool arp_resolve(uint32_t next_hop, uint32_t timeout_ms) {
+    return arp_resolve_impl(next_hop, timeout_ms);
+}
+}  // namespace internal
 
 // Called by the DHCP thread on ACK. Single writer (thread), lock-free
 // single-copy stores; readers use plain loads (eventual consistency).
@@ -370,7 +397,7 @@ const uint8_t *mac() { return s_ready ? s_dev.mac : nullptr; }
 uint32_t ip() { return s_ip; }
 uint32_t gw() { return s_gw; }
 uint32_t mask() { return s_mask; }
-uint32_t dns() { return s_dns; }
+uint32_t dns_server() { return s_dns; }
 IpSource ip_source() { return s_source; }
 const char *ip_source_str() {
     switch (s_source) {
@@ -437,23 +464,7 @@ int ping(uint32_t dst_ip, int count, uint32_t timeout_ms) {
         internal::Lock guard;
         next = ((dst_ip & s_mask) == (s_ip & s_mask)) ? dst_ip : s_gw;
     }
-    {
-        internal::Lock guard;
-        if (!arp_lookup(next)) arp_request(next);
-    }
-    {
-        uint64_t t0 = internal::now_ms();
-        for (;;) {
-            bool have = false;
-            {
-                internal::Lock guard;
-                have = arp_lookup(next) != nullptr;
-            }
-            if (have || internal::now_ms() - t0 >= 1000) break;
-            poll();
-            for (int i = 0; i < 20000; i++) asm volatile("pause");
-        }
-    }
+    internal::arp_resolve(next, 1000);
     int got = 0;
     s_ping_id++;
     for (int i = 0; i < count; i++) {

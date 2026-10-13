@@ -56,6 +56,7 @@ add_executable(chocoos.elf
   kernel/net/net.cpp
   kernel/net/udp.cpp
   kernel/net/dhcp.cpp
+  kernel/net/dns.cpp
 )
 
 target_include_directories(chocoos.elf PRIVATE
