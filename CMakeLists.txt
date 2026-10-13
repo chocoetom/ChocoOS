@@ -30,6 +30,7 @@ add_executable(chocoos.elf
   kernel/cpu/pic.cpp
   kernel/cpu/pit.cpp
   kernel/cpu/keyboard.cpp
+  kernel/cpu/tty.cpp
   kernel/cpu/mouse.cpp
   kernel/cpu/isr.asm
   kernel/cpu/gdt.cpp
@@ -57,6 +58,7 @@ add_executable(chocoos.elf
   kernel/net/udp.cpp
   kernel/net/dhcp.cpp
   kernel/net/dns.cpp
+  kernel/net/tcp.cpp
 )
 
 target_include_directories(chocoos.elf PRIVATE

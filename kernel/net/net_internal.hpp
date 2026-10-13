@@ -66,6 +66,12 @@ namespace choco::net::udp {
 void dispatch(uint32_t src_ip, uint32_t dst_ip, const uint8_t *dgram, uint16_t dgram_len);
 }  // namespace choco::net::udp
 
+// Internal entries: IPv4 layer -> TCP engine (kernel/net/tcp.cpp).
+namespace choco::net::tcp {
+void dispatch(uint32_t src_ip, uint32_t dst_ip, const uint8_t *seg, uint16_t seg_len);
+void poll_timers();
+}  // namespace choco::net::tcp
+
 // Internal entry: DHCP thread -> dynamic config (kernel/net/net.cpp).
 // Single writer (the DHCP thread); plain single-copy stores.
 namespace choco::net {

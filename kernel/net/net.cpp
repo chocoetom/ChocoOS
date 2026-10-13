@@ -64,6 +64,7 @@ struct UdpHdr {
 constexpr uint16_t ETH_ARP = 0x0806;
 constexpr uint16_t ETH_IP = 0x0800;
 constexpr uint8_t IP_ICMP = 1;
+constexpr uint8_t IP_TCP = 6;
 constexpr uint8_t IP_UDP = 17;
 constexpr uint32_t IP_BCAST_ALL = 0xFFFFFFFFu;
 
@@ -292,7 +293,8 @@ void handle_ipv4(const uint8_t src_mac[6], const uint8_t *frame, uint16_t len) {
         handle_icmp(src_mac, src, pl, pl_len);
     else if (h->proto == IP_UDP)
         udp::dispatch(src, dst, pl, pl_len);
-    // TCP arrives in net-4: counted as ip_rx, dropped here.
+    else if (h->proto == IP_TCP)
+        tcp::dispatch(src, dst, pl, pl_len);
 }
 
 void handle_frame(const uint8_t *frame, uint16_t len) {
@@ -389,6 +391,7 @@ void poll() {
         if (n > (int)sizeof(buf)) n = sizeof(buf);
         handle_frame(buf, (uint16_t)n);
     }
+    tcp::poll_timers();
 }
 
 bool ready() { return s_ready; }

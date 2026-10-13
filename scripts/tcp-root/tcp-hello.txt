@@ -1,0 +1,2 @@
+CHOCO_TCP_OK hello from the host fixture
+second line for a multi-segment body check 0123456789

@@ -115,6 +115,32 @@ def decode_dns(udp):
     return out
 
 
+def decode_tcp(seg):
+    # seg: full TCP segment. Returns "tcp ..." summary or "".
+    if len(seg) < 20:
+        return ""
+    sport = (seg[0] << 8) | seg[1]
+    dport = (seg[2] << 8) | seg[3]
+    seq = struct.unpack(">I", seg[4:8])[0]
+    ack = struct.unpack(">I", seg[8:12])[0]
+    doff = (seg[12] >> 4) * 4
+    flags = seg[13]
+    fl = ""
+    fl += "S" if flags & 0x02 else ""
+    fl += "A" if flags & 0x10 else ""
+    fl += "F" if flags & 0x01 else ""
+    fl += "R" if flags & 0x04 else ""
+    fl += "P" if flags & 0x08 else ""
+    out = f"tcp {sport}->{dport} seq={seq} ack={ack} flags={fl or '-'}"
+    if doff < 20 or doff > len(seg):
+        return out
+    data = seg[doff:]
+    if data:
+        line = "".join(chr(b) if 32 <= b < 127 else "." for b in data[:64])
+        out += f" data=[{line}]"
+    return out
+
+
 path = sys.argv[1] if len(sys.argv) > 1 else "build/dbg-trace.pcap"
 d = open(path, "rb").read()
 if len(d) < 24:
@@ -148,6 +174,13 @@ while off + 16 <= len(d):
         extra = f"ip proto={proto} {sip}->{dip}"
         if proto == 1 and len(pkt) >= 42:
             extra += f" icmp type={pkt[34]} code={pkt[35]}"
+        if proto == 6 and len(pkt) >= 34:
+            ihl = (pkt[14] & 0xF) * 4
+            seg = pkt[14 + ihl:]
+            if seg:
+                td = decode_tcp(seg)
+                if td:
+                    extra += f" {td}"
         if proto == 17 and len(pkt) >= 42:
             sport = (pkt[34] << 8) | pkt[35]
             dport = (pkt[36] << 8) | pkt[37]

@@ -110,6 +110,8 @@ void c_help(int, char **) {
         "  arp                  show ARP table",
         "  dhcp [renew]         DHCP status (renews in background)",
         "  udpstat              UDP sockets and counters",
+        "  tcpstat              TCP counters",
+        "  httpget <h> [p] [u]  HTTP/1.0 GET (needs TCP + DNS)",
         "  dns <name>           resolve A records via UDP (try 'dns example.com')",
     };
     con::println("commands:", ACC);
@@ -251,6 +253,10 @@ void c_gui(int, char **) {
 // Deterministic gesture test: synthesizes pointer motion through
 // mouse::inject and checks the terminal window actually moved.
 void c_wintest(int, char **) {
+    // The desktop boots with the terminal hidden, and a hidden window cannot
+    // be grabbed by any hit test - show it first or the gestures test nothing.
+    gui::show_term();
+    gui::tick();
     int x0 = 0, y0 = 0;
     gui::term_pos(x0, y0);
     // Dismiss the start menu first (an open menu eats the next press,
@@ -279,10 +285,34 @@ void c_wintest(int, char **) {
     con::kprintf(ok ? OK : ERR, BG, "[wintest] term now at %d,%d: %s\n",
                  x1, y1, ok ? "PASS (drag works)" : "FAIL");
 
-    // Resize: grab the right edge and drag it 60px outward.
+    // Drag back to the start. The terminal is 1184x696 on a 1280x800 screen,
+    // so after +100/+80 it hangs over the right and bottom edges; the resize
+    // clamp would then legitimately shorten width/height and the assertions
+    // below would be meaningless.
+    const int px = x1 + 100, py = y1 + 10;  // grab point on the caption
+    mouse::inject(px, py, 0);
+    gui::tick();
+    mouse::inject(px, py, 1);
+    gui::tick();
+    for (int i = 1; i <= 4; i++) {
+        mouse::inject(px - i * 25, py - i * 20, 1);
+        gui::tick();
+    }
+    mouse::inject(px - 100, py - 80, 0);
+    gui::tick();
+    gui::term_pos(x1, y1);
+    const bool bok = (x1 == x0) && (y1 == y0);
+    con::kprintf(bok ? OK : ERR, BG, "[wintest] dragged back to %d,%d: %s\n", x1, y1,
+                 bok ? "PASS (reverse drag)" : "FAIL");
+
+    // Resize: grab the LEFT edge and drag it 60px inward. The right/bottom
+    // edges are off-screen here (the terminal is 1184x696 on a 1280x800
+    // display and the drag clamp lets it hang over the edge), so the pointer
+    // could never land on their grab band. Left edge also proves the coupled
+    // x/w math: x grows by the same amount the width shrinks.
     int w0 = 0, h0 = 0;
     gui::term_size(w0, h0);
-    const int ex = x1 + w0 - 1, ey = y1 + h0 / 2;
+    const int ex = x1, ey = y1 + h0 / 2;
     mouse::inject(ex, ey, 0);
     gui::tick();
     mouse::inject(ex, ey, 1);  // press on the border band
@@ -293,14 +323,16 @@ void c_wintest(int, char **) {
     }
     mouse::inject(ex + 60, ey, 0);  // release
     gui::tick();
-    int w1 = 0, h1 = 0;
+    int w1 = 0, h1 = 0, xr0 = 0, yr0 = 0;
     gui::term_size(w1, h1);
-    const bool rok = (w1 == w0 + 60) && (h1 == h0);
-    con::kprintf(rok ? OK : ERR, BG, "[wintest] resize %dx%d -> %dx%d: %s\n", w0, h0, w1, h1,
-                 rok ? "PASS (edge drag)" : "FAIL");
+    gui::term_pos(xr0, yr0);
+    const bool rok = (w1 == w0 - 60) && (h1 == h0) && (xr0 == x1 + 60) && (yr0 == y1);
+    con::kprintf(rok ? OK : ERR, BG,
+                 "[wintest] resize %dx%d@%d,%d -> %dx%d@%d,%d: %s\n", w0, h0, x1, y1, w1, h1,
+                 xr0, yr0, rok ? "PASS (edge drag)" : "FAIL");
 
-    // Maximize: double-click the caption.
-    const int cx = x1 + 100, cy = y1 + 10;
+    // Maximize: double-click the caption (at the post-resize position).
+    const int cx = xr0 + 100, cy = yr0 + 10;
     mouse::inject(cx, cy, 1);
     gui::tick();
     mouse::inject(cx, cy, 0);
@@ -327,7 +359,9 @@ void c_wintest(int, char **) {
     int wr = 0, hr = 0, xr = 0, yr = 0;
     gui::term_size(wr, hr);
     gui::term_pos(xr, yr);
-    const bool rok2 = (wr == w1) && (hr == h1) && (xr == x1) && (yr == y1);
+    // Only a real round trip counts: without the maximize above, the geometry
+    // would be unchanged and this would pass vacuously.
+    const bool rok2 = mok && (wr == w1) && (hr == h1) && (xr == xr0) && (yr == yr0);
     con::kprintf(rok2 ? OK : ERR, BG, "[wintest] restore to %dx%d at %d,%d: %s\n", w1, h1, xr, yr,
                  rok2 ? "PASS (geometry round-trip)" : "FAIL");
 }
@@ -531,6 +565,97 @@ void c_udpstat(int, char **) {
                  net::udp::socket_count(), st.rx, st.tx, st.dropped, st.csum_err);
 }
 
+void c_tcpstat(int, char **) {
+    const auto &st = net::tcp::stats();
+    const auto &n = net::stats();
+    con::kprintf(FG, BG, "tcp: rx %llu tx %llu retrans %llu rst %llu drop %llu | ip rx %llu tx %llu\n",
+                 st.rx_segs, st.tx_segs, st.retrans, st.rst_rx, st.dropped, n.ip_rx,
+                 n.ip_tx);
+}
+
+void c_httpget(int argc, char **argv) {
+    // Kernel-side HTTP/1.0 GET over the internal TCP engine (no syscalls:
+    // the syscall/socket layer in net-5 will reuse tcp::connect/send/recv).
+    if (argc < 2) {
+        con::println("usage: httpget <host> [port] [path]  (try 'httpget 10.0.2.2 18080 /')",
+                     ERR);
+        return;
+    }
+    const char *host = argv[1];
+    uint64_t port = 80;
+    if (argc > 2 && !util::parse_uint(argv[2], port)) {
+        con::println("usage: httpget <host> [port] [path]", ERR);
+        return;
+    }
+    const char *path = (argc > 3) ? argv[3] : "/";
+    if (port == 0 || port > 65535) {
+        con::println("httpget: bad port", ERR);
+        return;
+    }
+    uint32_t ip = 0;
+    if (!net::parse_ipv4(host, ip)) {
+        uint32_t ips[2]{};
+        int rc = net::dns::resolve(host, ips, 2, 6000);
+        if (rc <= 0) {
+            con::kprintf(ERR, BG, "httpget: cannot resolve '%s' (%d)\n", host, rc);
+            return;
+        }
+        ip = ips[0];
+    }
+    char ips[16];
+    net::fmt_ipv4(ip, ips);
+    con::kprintf(FG, BG, "[http] GET http://%s:%llu%s (%s)...\n", host, port, path, ips);
+    net::tcp::Handle h = net::tcp::connect(ip, (uint16_t)port, 10000);
+    if (h < 0) {
+        con::kprintf(ERR, BG, "[http] connect %s:%llu failed\n", ips, port);
+        return;
+    }
+    char req[256];
+    size_t rl = 0;
+    const char *p1 = "GET ";
+    const char *p2 = " HTTP/1.0\r\nHost: ";
+    const char *p3 = "\r\nConnection: close\r\n\r\n";
+    auto put = [&](const char *s) {
+        while (*s && rl < sizeof(req) - 1) req[rl++] = *s++;
+    };
+    put(p1);
+    put(path);
+    put(p2);
+    put(host);
+    put(p3);
+    if (net::tcp::send(h, req, (uint16_t)rl) < 0) {
+        con::println("[http] send failed", ERR);
+        net::tcp::close(h);
+        return;
+    }
+    uint32_t total = 0;
+    bool got_status = false;
+    for (;;) {
+        static uint8_t buf[1024];
+        int n = net::tcp::recv(h, buf, sizeof(buf), 3000);
+        if (n < 0) {
+            con::kprintf(ERR, BG, "[http] recv error after %u bytes\n", total);
+            break;
+        }
+        if (n == 0) break;  // EOF (server FIN)
+        total += (uint32_t)n;
+        if (!got_status) {
+            got_status = true;
+            con::print("[http] status: ", FG, BG);
+            for (int i = 0; i < n && buf[i] != '\n' && i < 80; i++)
+                con::put_char((char)buf[i], FG, BG);
+            con::put_char('\n', FG, BG);
+        }
+        for (int i = 0; i < n; i++) con::put_char((char)buf[i], FG, BG);
+        if (total > 8192) {
+            con::println("[http] body cap reached, closing", FG);
+            break;
+        }
+    }
+    con::kprintf(total ? OK : ERR, BG, "[http] done: %u body bytes\n", total);
+    net::tcp::close(h);
+}
+
 void c_pci(int, char **) {
     int n = 0;
     for (int bus = 0; bus < 256; bus++) {
@@ -582,6 +707,8 @@ const Cmd kCmds[] = {
     {"dns", "resolve a name", c_dns},
     {"dhcp", "DHCP status/renew", c_dhcp},
     {"udpstat", "UDP stats", c_udpstat},
+    {"tcpstat", "TCP stats", c_tcpstat},
+    {"httpget", "HTTP GET via TCP", c_httpget},
     {"pci", "list PCI devices", c_pci},
 };
 

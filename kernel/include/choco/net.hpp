@@ -52,6 +52,7 @@ struct Stats {
     uint64_t ip_rx = 0, ip_tx = 0;
     uint64_t icmp_rx = 0, icmp_tx = 0, icmp_reply = 0;
     uint64_t udp_rx = 0, udp_tx = 0, udp_drop = 0;
+    uint64_t tcp_rx = 0, tcp_tx = 0, tcp_retrans = 0, tcp_drop = 0;
 };
 const Stats &stats();
 
@@ -111,5 +112,34 @@ namespace dns {
 int resolve(const char *name, uint32_t *out_ips, int max_ips, uint32_t timeout_ms);
 
 }  // namespace dns
+
+namespace tcp {
+
+// Minimal TCP client (no listen/accept; see kernel/net/tcp.cpp).
+// Memory-bounded: fixed TCB table, 16KB RX/TX stream buffers each.
+// Parsing is length-checked (bounds F1-F8 in tcp.cpp). No syscalls here:
+// this is the kernel-internal API used by shell test commands (httpget).
+// Socket syscalls (socket/connect/send/recv) come in net-5, on top.
+using Handle = int;  // 0..MAX_CONN-1, or -1 when invalid
+inline constexpr int MAX_CONN = 4;
+
+// Active open. Returns a handle or -1 on timeout/refusal.
+Handle connect(uint32_t dst_ip, uint16_t dst_port, uint32_t timeout_ms);
+// Queue bytes for sending (copies into the TCB). Returns bytes queued or -1.
+int send(Handle h, const void *data, uint16_t len);
+// Receive in-order bytes. Returns bytes, 0 on orderly FIN (EOF), or -1 on
+// timeout/error. Never blocks past timeout_ms.
+int recv(Handle h, void *buf, uint16_t max, uint32_t timeout_ms);
+// Graceful close (FIN exchange, bounded). Always frees the TCB.
+void close(Handle h);
+// True once ESTABLISHED (or later but not CLOSED/failed).
+bool is_open(Handle h);
+
+struct ConnStats {
+    uint64_t rx_segs = 0, tx_segs = 0, retrans = 0, rst_rx = 0, dropped = 0;
+};
+const ConnStats &stats();
+
+}  // namespace tcp
 
 }  // namespace choco::net
