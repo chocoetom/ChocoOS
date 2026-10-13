@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor
+Comment=CPU, memory, disk and network
+Exec=bin/sysmon
+Icon=system-monitor
+OnlyShowIn=Desktop;StartMenu;Taskbar;

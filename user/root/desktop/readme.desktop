@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Link
+Name=Read me
+Comment=What this FAT volume is for
+URL=disk/README.TXT
+Icon=txt-file
+OnlyShowIn=Desktop;StartMenu;

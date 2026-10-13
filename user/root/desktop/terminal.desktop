@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=ChocoOS shell
+Exec=choco://terminal
+Icon=terminal-icon
+OnlyShowIn=Desktop;StartMenu;Taskbar;

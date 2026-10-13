@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Link
+Name=Documents
+Comment=Open the FAT32 Documents folder
+URL=disk/Documents
+Icon=documents
+OnlyShowIn=Desktop;
