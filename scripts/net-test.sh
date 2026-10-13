@@ -90,16 +90,30 @@ if [ -f "$PCAP" ]; then
     else
       echo "FAIL: pcap has no ICMP"; fail=$((fail + 1))
     fi
-  elif command -v tshark >/dev/null 2>&1; then
-    tshark -r "$PCAP" 2>&1 | head -30
   else
-    echo "(no tcpdump/tshark: open $PCAP on the host)"
-    # pcap larger than the 24-byte global header means packets were dumped
-    sz=$(wc -c < "$PCAP")
-    if [ "$sz" -gt 100 ]; then echo "PASS: pcap non-empty"; pass=$((pass + 1));
-    else echo "FAIL: pcap empty"; fail=$((fail + 1)); fi
+    python3 scripts/pcap.py "$PCAP"
+    if python3 scripts/pcap.py "$PCAP" 2>/dev/null | grep -q "arp op=1"; then
+      echo "PASS: pcap has ARP request"; pass=$((pass + 1))
+    else
+      echo "FAIL: pcap missing ARP request"; fail=$((fail + 1))
+    fi
+    if python3 scripts/pcap.py "$PCAP" 2>/dev/null | grep -q "arp op=2"; then
+      echo "PASS: pcap has ARP reply"; pass=$((pass + 1))
+    else
+      echo "FAIL: pcap missing ARP reply"; fail=$((fail + 1))
+    fi
+    if python3 scripts/pcap.py "$PCAP" 2>/dev/null | grep -q "icmp type=8"; then
+      echo "PASS: pcap has ICMP echo request"; pass=$((pass + 1))
+    else
+      echo "FAIL: pcap missing ICMP echo"; fail=$((fail + 1))
+    fi
+    if python3 scripts/pcap.py "$PCAP" 2>/dev/null | grep -q "icmp type=0"; then
+      echo "PASS: pcap has ICMP echo reply"; pass=$((pass + 1))
+    else
+      echo "FAIL: pcap missing ICMP reply"; fail=$((fail + 1))
+    fi
   fi
-  echo "inspect: tcpdump -r $PCAP -n -e -v"
+  echo "inspect: tcpdump -r $PCAP -n -e -v (or python3 scripts/pcap.py $PCAP)"
 else
   echo "FAIL: no pcap generated"; fail=$((fail + 1))
 fi

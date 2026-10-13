@@ -50,9 +50,4 @@ const Stats &stats();
 int arp_count();
 bool arp_get(int idx, uint32_t *ip, uint8_t mac_out[6]);
 
-// Debug: raw notify MR base for `netpoke` (nullptr when !ready).
-uint8_t *debug_notify_base();
-// Debug: print q1 (TX) ring contents (`netdump`).
-void debug_dump_tx();
-
 }  // namespace choco::net

@@ -22,6 +22,12 @@ for i in $(seq 1 60); do
 done
 printf 'info pci\n' >&"${Q[1]}"
 sleep 2
+printf 'info virtio\n' >&"${Q[1]}"
+sleep 2
+printf 'info virtio /machine/peripheral-anon/device[0]/virtio-backend\n' >&"${Q[1]}"
+sleep 2
+printf 'help info virtio\n' >&"${Q[1]}"
+sleep 1
 printf 'info mtree\n' >&"${Q[1]}"
 sleep 3
 printf 'info network\n' >&"${Q[1]}"

@@ -358,36 +358,6 @@ void c_dns(int argc, char **) {
     con::println("dns: todo in net-3 (needs UDP first). Try 'ping 10.0.2.2'.", FG);
 }
 
-void c_netdump(int, char **) {
-    // DEBUG: show q1 (TX) ring contents as the device should see them.
-    net::debug_dump_tx();
-}
-
-void c_netpoke(int argc, char **argv) {
-    // DEBUG: raw u16 write to the virtio notify MR. Usage: netpoke <off> <val>
-    if (argc < 3) {
-        con::println("usage: netpoke <off> <val>", ERR);
-        return;
-    }
-    uint64_t off = 0, val = 0;
-    if (!util::parse_uint(argv[1], off) || !util::parse_uint(argv[2], val)) {
-        con::println("usage: netpoke <off> <val>", ERR);
-        return;
-    }
-    uint8_t *base = net::debug_notify_base();
-    if (!base) {
-        con::println("netpoke: no NIC", ERR);
-        return;
-    }
-    con::kprintf(FG, BG, "netpoke [%llu] = %llu...\n", off, val);
-    *(volatile uint16_t *)(base + off) = (uint16_t)val;
-    for (volatile int i = 0; i < 50000; i++) asm volatile("pause");
-    net::poll();
-    const auto &st = net::stats();
-    con::kprintf(FG, BG, "after poke: rx %llu tx %llu drop %llu arp_rx %llu ip_rx %llu\n",
-                 st.rx, st.tx, st.dropped, st.arp_rx, st.ip_rx);
-}
-
 void c_pci(int, char **) {
     int n = 0;
     for (int bus = 0; bus < 256; bus++) {
@@ -398,8 +368,10 @@ void c_pci(int, char **) {
                 if (ven == 0xFFFF) continue;
                 uint16_t dev =
                     pci::read_config16((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x02);
-                con::kprintf(FG, BG, "pci %x:%x.%d ven %x dev %x\n", bus, slot, func,
-                             ven, dev);
+                uint16_t cmd =
+                    pci::read_config16((uint8_t)bus, (uint8_t)slot, (uint8_t)func, 0x04);
+                con::kprintf(FG, BG, "pci %x:%x.%d ven %x dev %x cmd %x\n", bus, slot, func,
+                             ven, dev, cmd);
                 if (++n > 32) {
                     con::println("(truncated)", FG);
                     return;
@@ -434,8 +406,6 @@ const Cmd kCmds[] = {
     {"arp", "show ARP table", c_arp},
     {"dns", "resolve a name (todo)", c_dns},
     {"pci", "list PCI devices", c_pci},
-    {"netpoke", "raw notify write (debug)", c_netpoke},
-    {"netdump", "dump TX ring state (debug)", c_netdump},
 };
 
 // Try to run a program from initrd: handles "./x" and bare "x" (tries bin/x).

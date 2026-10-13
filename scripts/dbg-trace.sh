@@ -39,8 +39,8 @@ type_line() {
   sleep 6
 }
 
+type_line "pci"
 type_line "netdump"
-type_line "netpoke 0 1"
 printf 'quit\n' >&"${Q[1]}" 2>/dev/null || true
 sleep 2
 echo "trace lines: $(wc -c < build/trace.log)"

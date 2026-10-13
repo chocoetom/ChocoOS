@@ -75,6 +75,12 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/kernel/gen/icons.inc")
     OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/kernel/gen/icons.inc")
   target_compile_definitions(chocoos.elf PRIVATE ASSET_ICONS=1)
 endif()
+# Baked UI font (scripts/build-font.py): proportional + anti-aliased chrome.
+if(EXISTS "${CMAKE_SOURCE_DIR}/kernel/gen/uifont.inc")
+  set_property(SOURCE kernel/console.cpp APPEND PROPERTY
+    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/kernel/gen/uifont.inc")
+  target_compile_definitions(chocoos.elf PRIVATE ASSET_UIFONT=1)
+endif()
 
 # NOTE: C/C++ flags are scoped so NASM receives none (it chokes on -f*/--target).
 target_compile_options(chocoos.elf PRIVATE

@@ -484,37 +484,4 @@ bool arp_get(int idx, uint32_t *ip, uint8_t mac_out[6]) {
     return false;
 }
 
-uint8_t *debug_notify_base() {
-    if (!s_ready) return nullptr;
-    return s_dev.vdev.notify_base;
-}
-
-void debug_dump_tx() {
-    if (!s_ready) {
-        console::println("netdump: no NIC", console::ERR);
-        return;
-    }
-    virtio::Device *vdev = &s_dev.vdev;
-    virtio::VirtQueue *vq = &vdev->queues[1];
-    volatile uint16_t *avail_idx_p = (volatile uint16_t *)((uint8_t *)vq->avail_virt + 2);
-    volatile uint16_t *used_idx_p = (volatile uint16_t *)((uint8_t *)vq->used_virt + 2);
-    volatile uint16_t *ring = (volatile uint16_t *)((uint8_t *)vq->avail_virt + 4);
-    console::kprintf(FG, BG, "txq: size=%u avail=%u used=%u last=%u free=%u\n", vq->size,
-                     *avail_idx_p, *used_idx_p, vq->last_used_idx, vq->num_free);
-    // Independent check: translate() must round-trip desc/avail/used GPAs.
-    console::kprintf(FG, BG, "  tr: desc=0x%lx avail=0x%lx used=0x%lx\n",
-                     paging::translate((uint64_t)vq->desc_virt),
-                     paging::translate((uint64_t)vq->avail_virt),
-                     paging::translate((uint64_t)vq->used_virt));
-    for (int i = 0; i < 4; i++)
-        console::kprintf(FG, BG, "  avail_ring[%d]=%u\n", i, ring[i]);
-    for (int i = 0; i < 2; i++) {
-        uint8_t *d = (uint8_t *)vq->desc_virt + (size_t)i * 16;
-        uint64_t a = *(volatile uint64_t *)(d + 0);
-        uint32_t l = *(volatile uint32_t *)(d + 8);
-        uint16_t f = *(volatile uint16_t *)(d + 12);
-        console::kprintf(FG, BG, "  desc[%d] addr=0x%lx len=%u flags=%u\n", i, a, l, f);
-    }
-}
-
 }  // namespace choco::net

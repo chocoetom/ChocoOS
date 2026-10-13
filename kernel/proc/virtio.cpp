@@ -240,9 +240,6 @@ bool setup_queue(Device *dev, int qidx, uint16_t size) {
     if (qidx < 0 || qidx >= 4) return false;
     cc16w(dev, REG_QUEUE_SEL, (uint16_t)qidx);
     barrier();
-    // Disable in case it was left enabled
-    cc16w(dev, REG_QUEUE_ENABLE, 0);
-    barrier();
     uint16_t max = cc16(dev, REG_QUEUE_SIZE);
     if (max == 0) return false;
     if (size > max) size = max;
@@ -308,9 +305,6 @@ void notify_queue(Device *dev, int qidx) {
         cpu::outw((uint16_t)(dev->notify_port + off), (uint16_t)qidx);
     } else {
         *(volatile uint16_t *)(dev->notify_base + off) = (uint16_t)qidx;
-        // DEBUG: also kick via the transitional legacy IO doorbell (BAR0
-        // 0xc000 + QUEUE_NOTIFY 16). Remove once modern routing is confirmed.
-        cpu::outw(0xc000 + 16, (uint16_t)qidx);
     }
     barrier();
 }

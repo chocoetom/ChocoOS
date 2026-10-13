@@ -22,8 +22,9 @@ struct NetHdr {
     uint16_t gso_size;
     uint16_t csum_start;
     uint16_t csum_offset;
+    uint16_t num_buffers;  // only when MRG_RXBUF negotiated (else absent)
 };
-static_assert(sizeof(NetHdr) == 10, "virtio_net_hdr must be 10 bytes");
+static_assert(sizeof(NetHdr) == 12, "virtio_net_hdr_mrg is 12 bytes");
 
 struct NetConfig {
     uint8_t mac[6];
@@ -33,12 +34,13 @@ struct NetConfig {
 };
 
 constexpr int RX_N = 32;
-constexpr uint32_t RX_BUF_SZ = 2048;  // fits in one page with the 10B vnet hdr
+constexpr uint32_t RX_BUF_SZ = 2048;  // fits virtio header + full frame
 constexpr uint32_t TX_BUF_SZ = 2048;
 
 uint64_t s_rx_phys[RX_N]{};  // one pmm page per RX buffer (exact GPAs)
 uint64_t s_tx_phys = 0;      // one pmm page TX bounce buffer
 uint8_t *s_tx_virt = nullptr;
+uint32_t s_hdr_sz = 10;  // 12 when MRG_RXBUF accepted, else 10
 
 }  // namespace
 
@@ -95,6 +97,7 @@ bool probe_and_init(NetDevice *net) {
         console::kprintf(FG, BG, "[virtio-net] device refused VERSION_1\n");
         return false;
     }
+    s_hdr_sz = (vdev->driver_features & VIRTIO_NET_F_MRG_RXBUF) ? 12 : 10;
 
     if (vdev->driver_features & VIRTIO_NET_F_MAC) {
         util::memcpy(net->mac, vdev->device_cfg, 6);
@@ -143,11 +146,14 @@ bool probe_and_init(NetDevice *net) {
         return false;
     }
     s_tx_virt = (uint8_t *)paging::phys_to_virt(s_tx_phys);
-    virtio::notify_queue(vdev, 0);
+    // NOTE: no notify before DRIVER_OK (spec): the bring-up kick happens
+    // after DRIVER_OK below.
 
     virtio::set_status(vdev,
                        virtio::VIRTIO_STATUS_ACK | virtio::VIRTIO_STATUS_DRIVER |
                            virtio::VIRTIO_STATUS_FEATURES_OK | virtio::VIRTIO_STATUS_DRIVER_OK);
+    // First notify only now that the device is running.
+    virtio::notify_queue(vdev, 0);
 
     uint8_t st = virtio::get_status(vdev);
     uint64_t feat = vdev->driver_features;
@@ -179,7 +185,7 @@ void reset(NetDevice *net) {
     if (net) virtio::set_status(&net->vdev, 0);
 }
 
-// Reap one RX frame into buf (strips 10-byte virtio header).
+// Reap one RX frame into buf (strips the virtio-net header).
 // Returns frame length or -1 when no packet is ready.
 int recv_packet(NetDevice *net, void *buf, uint32_t max_len) {
     if (!net || !buf || max_len == 0) return -1;
@@ -193,10 +199,10 @@ int recv_packet(NetDevice *net, void *buf, uint32_t max_len) {
         uint64_t bphys = *(volatile uint64_t *)(d + 0);
         uint8_t *bvirt = (uint8_t *)paging::phys_to_virt(bphys);
         uint32_t copy = 0;
-        if (used_len > sizeof(NetHdr) && bvirt) {
-            copy = used_len - sizeof(NetHdr);
+        if (used_len > s_hdr_sz && bvirt) {
+            copy = used_len - s_hdr_sz;
             if (copy > max_len) copy = max_len;
-            util::memcpy(buf, bvirt + sizeof(NetHdr), copy);
+            util::memcpy(buf, bvirt + s_hdr_sz, copy);
         }
         // Re-post the same buffer
         virtio::virtqueue_free(vdev, 0, (uint16_t)desc);
@@ -212,12 +218,12 @@ int recv_packet(NetDevice *net, void *buf, uint32_t max_len) {
 
 int send_packet(NetDevice *net, const void *buf, uint32_t len) {
     if (!net || !buf || len == 0) return -1;
-    if (len + sizeof(NetHdr) > TX_BUF_SZ) return -1;
+    if (len + s_hdr_sz > TX_BUF_SZ) return -1;
     if (!s_tx_virt) return -1;
-    util::memset(s_tx_virt, 0, sizeof(NetHdr));
-    util::memcpy(s_tx_virt + sizeof(NetHdr), buf, len);
+    util::memset(s_tx_virt, 0, s_hdr_sz);
+    util::memcpy(s_tx_virt + s_hdr_sz, buf, len);
     virtio::Device *vdev = &net->vdev;
-    int desc = virtio::virtqueue_add(vdev, 1, s_tx_phys, len + sizeof(NetHdr), 0);
+    int desc = virtio::virtqueue_add(vdev, 1, s_tx_phys, len + s_hdr_sz, 0);
     if (desc < 0) {
         return -1;
     }
