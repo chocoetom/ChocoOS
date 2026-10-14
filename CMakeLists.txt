@@ -26,15 +26,19 @@ add_executable(chocoos.elf
   kernel/mem/paging.cpp
   kernel/mem/heap.cpp
   kernel/mem/rt.cpp
+  kernel/mem/memfd.cpp
   kernel/cpu/idt.cpp
   kernel/cpu/pic.cpp
   kernel/cpu/pit.cpp
   kernel/cpu/keyboard.cpp
   kernel/cpu/tty.cpp
+  kernel/cpu/rtc.cpp
   kernel/cpu/mouse.cpp
+  kernel/cpu/cpuid.asm
   kernel/cpu/isr.asm
   kernel/cpu/gdt.cpp
   kernel/cpu/gdt.asm
+  kernel/cpu/cpuinfo.cpp
   kernel/cpu/sched.cpp
   kernel/cpu/switch.asm
   kernel/cpu/usermode.asm
@@ -47,6 +51,7 @@ add_executable(chocoos.elf
   kernel/proc/elf.cpp
   kernel/proc/fs.cpp
   kernel/proc/procfs.cpp
+  kernel/proc/shortcuts.cpp
   kernel/proc/linux.cpp
   kernel/proc/proc.cpp
   kernel/proc/virtio.cpp
@@ -54,6 +59,7 @@ add_executable(chocoos.elf
   kernel/proc/virtio_net.cpp
   kernel/proc/vfs.cpp
   kernel/proc/fat32.cpp
+  kernel/crypto/rand.cpp
   kernel/net/net.cpp
   kernel/net/udp.cpp
   kernel/net/dhcp.cpp

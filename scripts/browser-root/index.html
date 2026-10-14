@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ChocoOS Browser Test</title>
+  <style>body { color: red; } /* must be ignored by the v1 renderer */</style>
+  <script>var x = "<div>should not render</div>";</script>
+</head>
+<body>
+  <h1>Choco Heading One</h1>
+  <h3>A Smaller Heading</h3>
+  <p>This paragraph contains <b>bold text</b> and <i>italic text</i>
+     and it is long enough that the browser must word-wrap it across
+     several lines inside the content area to prove the layout engine works.</p>
+  <p>CHOCO_BROWSER_RENDER_OK is the marker the harness greps for.</p>
+  <ul>
+    <li>first list item</li>
+    <li>second list item</li>
+  </ul>
+  <p>Visit <a href="http://10.0.2.2:18081/page2.html">the second page</a> to test links.</p>
+  <hr>
+  <p>Entities: ampersand &amp; less &lt; than &gt; and a &nbsp; nbsp.</p>
+</body>
+</html>

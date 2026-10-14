@@ -1,12 +1,16 @@
 // ChocoOS v0.6 - Phase 5: user mode + syscalls + initrd (all output in English)
 #include <choco/boot.hpp>
 #include <choco/console.hpp>
+#include <choco/cpuinfo.hpp>
 #include <choco/cpu.hpp>
 #include <choco/gui.hpp>
 #include <choco/mem.hpp>
 #include <choco/mouse.hpp>
+#include <choco/rand.hpp>
+#include <choco/rtc.hpp>
 #include <choco/sched.hpp>
 #include <choco/shell.hpp>
+#include <choco/tty.hpp>
 #include <choco/user.hpp>
 #include <choco/serial.hpp>
 #include <choco/net.hpp>
@@ -53,8 +57,11 @@ extern "C" void kmain() {
     choco::idt::init();
     choco::pic::remap();
     choco::pit::init();
+    choco::rtc::init();   // read the CMOS wall clock once
+    choco::rand::init();  // seed the CSPRNG (RTC + TSC jitter + RDRAND/RDSEED)
     choco::kbd::init();
     choco::mouse::init();
+    choco::tty::init();   // console line discipline for ring-3 jobs
     choco::linux::init(); // EFER.SCE + SYSCALL entry (Linux translator)
     con::kprintf(OK, BG, "[idt] 49 vectors (0x80 = ring-3 syscalls, cs=0x%x) | [pic] 32/40 | [pit] %u Hz | [kbd] ps/2\n",
                  choco::cpu::read_cs(), choco::pit::HZ);
@@ -87,5 +94,8 @@ extern "C" void kmain() {
     choco::gui::init(); // desktop takes over the console surface
     choco::sched::set_started(true);
     choco::cpu::sti();
+    // Read the CPU identity and time the TSC against the PIT now, while interrupts
+    // are on: the same call from a syscall would have to halt with IF cleared.
+    choco::cpuinfo::get();
     choco::shell::run();
 }

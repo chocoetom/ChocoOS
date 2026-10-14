@@ -3,6 +3,7 @@
 #include <choco/console.hpp>
 #include <choco/net.hpp>
 #include <choco/paging.hpp>
+#include <choco/sched.hpp>
 #include <choco/serial.hpp>
 #include <choco/util.hpp>
 #include <choco/virtio_net.hpp>
@@ -153,6 +154,7 @@ bool send_eth_locked(const uint8_t dst[6], uint16_t ethertype, const void *paylo
     int rc = virtio_net::send_packet(&s_dev, frame, sizeof(Eth) + len);
     if (rc > 0) {
         s_stats.tx++;
+        s_stats.tx_bytes += sizeof(Eth) + len;
         return true;
     }
     s_stats.dropped++;
@@ -299,6 +301,7 @@ void handle_ipv4(const uint8_t src_mac[6], const uint8_t *frame, uint16_t len) {
 
 void handle_frame(const uint8_t *frame, uint16_t len) {
     s_stats.rx++;
+    s_stats.rx_bytes += len;
     if (len < sizeof(Eth)) {
         s_stats.dropped++;
         return;
@@ -335,9 +338,12 @@ bool arp_resolve_impl(uint32_t next_hop, uint32_t timeout_ms) {
             have = arp_lookup(next_hop) != nullptr;
         }
         if (have || internal::now_ms() - t0 >= timeout_ms) return have;
-        // poll() takes its own lock; pause outside all locks.
+        // poll() takes its own lock; pause outside all locks. Yield (not a
+        // busy spin): when this runs inside a syscall, interrupts are masked
+        // on entry, so without a yield neither the PIT (ticks) nor the NIC RX
+        // IRQ can fire and the wait would deadlock.
         poll();
-        for (int i = 0; i < 20000; i++) asm volatile("pause");
+        sched::sleep_ms(1);
     }
 }
 
@@ -401,6 +407,11 @@ uint32_t ip() { return s_ip; }
 uint32_t gw() { return s_gw; }
 uint32_t mask() { return s_mask; }
 uint32_t dns_server() { return s_dns; }
+// The name is ours to choose (one NIC, no discovery), but it is only reported
+// when a NIC was actually claimed.
+const char *if_name() { return s_ready ? "eth0" : ""; }
+const char *if_driver() { return s_ready ? "virtio-net" : ""; }
+uint16_t if_mtu() { return s_ready ? virtio_net::get_mtu(&s_dev) : 0; }
 IpSource ip_source() { return s_source; }
 const char *ip_source_str() {
     switch (s_source) {
@@ -568,6 +579,21 @@ bool arp_get(int idx, uint32_t *ip, uint8_t mac_out[6]) {
         if (n == idx) {
             if (ip) *ip = s_arp[i].ip;
             if (mac_out) util::memcpy(mac_out, s_arp[i].mac, 6);
+            return true;
+        }
+        n++;
+    }
+    return false;
+}
+bool arp_at(int idx, uint32_t *ip, uint8_t mac_out[6], uint64_t *last_ms) {
+    internal::Lock guard;
+    int n = 0;
+    for (int i = 0; i < ARP_N; i++) {
+        if (!s_arp[i].valid) continue;
+        if (n == idx) {
+            if (ip) *ip = s_arp[i].ip;
+            if (mac_out) util::memcpy(mac_out, s_arp[i].mac, 6);
+            if (last_ms) *last_ms = s_arp[i].last_ms;
             return true;
         }
         n++;

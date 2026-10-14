@@ -29,6 +29,12 @@ uint32_t gw();
 uint32_t mask();
 uint32_t dns_server();
 
+// Interface identity for /proc/net/dev. ChocoOS drives one NIC, so the name is
+// assigned rather than discovered; "" and 0 mean "no NIC", never a guess.
+const char *if_name();
+const char *if_driver();  // "virtio-net" when the PCI device was claimed
+uint16_t if_mtu();
+
 // Send an IPv4 payload (proto: 1=ICMP, 6=TCP, 17=UDP). Resolves ARP, may
 // trigger an ARP request and drop the packet when the MAC is unknown.
 // Broadcast destinations skip ARP and go to ff:ff:ff:ff:ff:ff.
@@ -48,6 +54,7 @@ void fmt_mac(const uint8_t *m, char *out);  // out must hold >= 18 bytes
 
 struct Stats {
     uint64_t rx = 0, tx = 0, dropped = 0;
+    uint64_t rx_bytes = 0, tx_bytes = 0;  // whole Ethernet frames, header included
     uint64_t arp_rx = 0, arp_tx = 0;
     uint64_t ip_rx = 0, ip_tx = 0;
     uint64_t icmp_rx = 0, icmp_tx = 0, icmp_reply = 0;
@@ -59,6 +66,8 @@ const Stats &stats();
 // ARP table inspection for the `arp` shell command.
 int arp_count();
 bool arp_get(int idx, uint32_t *ip, uint8_t mac_out[6]);
+// Same table with the age, for /proc/net/arp. last_ms may be nullptr.
+bool arp_at(int idx, uint32_t *ip, uint8_t mac_out[6], uint64_t *last_ms);
 void arp_flush();  // drop all entries (forces fresh resolution on next TX)
 
 namespace udp {
@@ -86,6 +95,17 @@ struct SockStats {
     uint64_t rx = 0, tx = 0, dropped = 0, csum_err = 0;
 };
 const SockStats &stats();
+
+// One bound socket, for /proc/net/udp. i counts bound sockets (not slots), so
+// it runs 0..socket_count()-1. False past the end.
+struct SockInfo {
+    uint16_t port = 0;
+    bool has_dgram = false;    // a datagram is queued and unread
+    uint16_t dgram_len = 0;
+    uint32_t from_ip = 0;
+    uint16_t from_port = 0;
+};
+bool sock_at(int i, SockInfo &out);
 
 }  // namespace udp
 
@@ -121,10 +141,15 @@ namespace tcp {
 // this is the kernel-internal API used by shell test commands (httpget).
 // Socket syscalls (socket/connect/send/recv) come in net-5, on top.
 using Handle = int;  // 0..MAX_CONN-1, or -1 when invalid
-inline constexpr int MAX_CONN = 4;
+inline constexpr int MAX_CONN = 8;
 
 // Active open. Returns a handle or -1 on timeout/refusal.
 Handle connect(uint32_t dst_ip, uint16_t dst_port, uint32_t timeout_ms);
+// Passive open: bind to `port` on `ip` (0 = any) and listen. Returns a handle.
+Handle listen(uint32_t ip, uint16_t port, int backlog);
+// Pop a completed inbound connection for listener `lh`. Returns a connected
+// handle, or -1 on timeout.
+Handle accept(Handle lh, uint32_t timeout_ms);
 // Queue bytes for sending (copies into the TCB). Returns bytes queued or -1.
 int send(Handle h, const void *data, uint16_t len);
 // Receive in-order bytes. Returns bytes, 0 on orderly FIN (EOF), or -1 on
@@ -134,11 +159,27 @@ int recv(Handle h, void *buf, uint16_t max, uint32_t timeout_ms);
 void close(Handle h);
 // True once ESTABLISHED (or later but not CLOSED/failed).
 bool is_open(Handle h);
+// Readiness for poll()/select(): true when a recv() would return immediately
+// (bytes buffered, EOF, or error).
+bool readable(Handle h);
 
 struct ConnStats {
     uint64_t rx_segs = 0, tx_segs = 0, retrans = 0, rst_rx = 0, dropped = 0;
 };
 const ConnStats &stats();
+
+// One connection, for /proc/net/tcp and the monitor's "connections" view.
+// i counts live TCBs, so it runs 0..conn_count()-1.
+struct ConnInfo {
+    uint32_t local_ip = 0, remote_ip = 0;
+    uint16_t local_port = 0, remote_port = 0;
+    const char *state = "";   // ESTABLISHED, SYN-SENT, FIN-WAIT-1, ...
+    uint16_t rx_pending = 0;  // bytes received and not yet read
+    uint16_t tx_pending = 0;  // bytes queued and not yet acknowledged
+    bool open = false;
+};
+int conn_count();
+bool conn_at(int i, ConnInfo &out);
 
 }  // namespace tcp
 

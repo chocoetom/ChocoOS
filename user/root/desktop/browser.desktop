@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Browser
+Comment=Fetch and read a web page (text + basic HTML)
+Exec=bin/browser
+Icon=bin/browser
+OnlyShowIn=Desktop;StartMenu;Taskbar;

@@ -62,7 +62,7 @@ constexpr uint32_t RTO_INIT = 1000;
 constexpr uint32_t RTO_MAX = 8000;
 constexpr int MAX_RETRIES = 5;
 
-enum class St : uint8_t { FREE, SYN_SENT, EST, FIN_W1, FIN_W2, CLOSE_WAIT, LAST_ACK, CLOSED };
+enum class St : uint8_t { FREE, LISTEN, SYN_SENT, SYN_RCVD, EST, FIN_W1, FIN_W2, CLOSE_WAIT, LAST_ACK, CLOSED };
 
 struct Tcb {
     bool used = false;
@@ -81,6 +81,8 @@ struct Tcb {
     uint64_t rto_deadline = 0;  // 0 = disarmed
     int retries = 0;
     bool fin_sent = false, fin_acked = false, fin_rcvd = false;
+    int listener = -1;  // parent listener handle (inbound children), -1 otherwise
+    int backlog = 0;    // LISTEN only: max half-open+pending children (clamped)
 };
 Tcb s_tcb[MAX_CONN]{};
 ConnStats s_stats{};
@@ -268,6 +270,10 @@ void poll_timers() {  // called from net::poll (locked) + wait loops
         s_stats.retrans++;
         if (t->st == St::SYN_SENT) {
             raw_send(t, F_SYN, t->snd_una, nullptr, 0, true);
+        } else if (t->st == St::SYN_RCVD) {
+            // Passive open: the SYN-ACK itself is outstanding (no data path
+            // yet, so pump() would be a no-op). Retransmit it directly.
+            raw_send(t, F_SYN | F_ACK, t->snd_una, nullptr, 0, true);
         } else {
             t->snd_nxt = t->snd_una;  // go-back-N rewind
             pump(t);
@@ -343,6 +349,47 @@ void dispatch(uint32_t src_ip, uint32_t dst_ip, const uint8_t *seg, uint16_t seg
     }
     Tcb *t = by_quad(src_ip, sport, dport);
     if (!t) {
+        // No matching connection: a listener on this port may take the SYN.
+        if ((flags & F_SYN) && !(flags & F_ACK)) {
+            for (int i = 0; i < MAX_CONN; i++) {
+                Tcb *l = &s_tcb[i];
+                if (!l->used || l->st != St::LISTEN || l->lport != dport) continue;
+                if (l->lip != 0 && l->lip != ip()) continue;
+                // Backlog cap: bound half-open + pending-accept children so
+                // one scanner cannot exhaust the 8-slot table (SYN drop on
+                // overload; the client retransmits).
+                int kids = 0;
+                for (int k = 0; k < MAX_CONN; k++)
+                    if (s_tcb[k].used && s_tcb[k].listener == i) kids++;
+                if (kids >= l->backlog) {
+                    s_stats.dropped++;
+                    return;
+                }
+                int c = -1;
+                for (int k = 0; k < MAX_CONN; k++)
+                    if (!s_tcb[k].used) { c = k; break; }
+                if (c < 0) break;
+                Tcb *ct = &s_tcb[c];
+                util::memset(ct, 0, sizeof(Tcb)); // in place: no 32 KiB stack temp
+                ct->used = true;
+                ct->st = St::SYN_RCVD;
+                ct->listener = i;
+                ct->lip = ip();
+                ct->rip = src_ip;
+                ct->lport = dport;
+                ct->rport = sport;
+                ct->rcv_nxt = seq + 1;
+                ct->snd_wnd = OUR_MSS;
+                ct->peer_mss = OUR_MSS;
+                ct->snd_una = ct->snd_nxt = s_isn;
+                s_isn += 0x10001u;
+                raw_send(ct, F_SYN | F_ACK, ct->snd_una, nullptr, 0, true);
+                ct->snd_nxt++;
+                ct->rto_ms = RTO_INIT;
+                ct->rto_deadline = internal::now_ms() + ct->rto_ms;
+                return;
+            }
+        }
         s_stats.dropped++;
         return;
     }
@@ -384,6 +431,20 @@ void dispatch(uint32_t src_ip, uint32_t dst_ip, const uint8_t *seg, uint16_t seg
             t->rto_deadline = 0;
             send_ack(t);
             pump(t);
+        }
+        return;
+    }
+    if (t->st == St::SYN_RCVD) {  // final ACK completing a passive open
+        // Duplicate SYN (our SYN-ACK was lost): retransmit SYN-ACK, re-arm.
+        if ((flags & F_SYN) && !(flags & F_ACK) && seq == t->rcv_nxt - 1) {
+            raw_send(t, F_SYN | F_ACK, t->snd_una, nullptr, 0, true);
+            t->rto_deadline = internal::now_ms() + t->rto_ms;
+            return;
+        }
+        if ((flags & F_ACK) && ack == t->snd_una + 1) {
+            t->snd_una = ack;
+            t->st = St::EST;
+            t->rto_deadline = 0;
         }
         return;
     }
@@ -454,7 +515,11 @@ Handle connect(uint32_t dst_ip, uint16_t dst_port, uint32_t timeout_ms) {
         }
         if (!lport) return -1;
         Tcb *t = &s_tcb[slot];
-        *t = Tcb{};
+        // Zero in place: a Tcb is ~32 KiB (rx/tx stream buffers), so a
+        // `Tcb{}` temporary would overflow the 16 KiB syscall stack
+        // (kernel/cpu/linux.asm) and clobber the scheduler globals that sit
+        // right below it (s_current, s_count, s_started, s_hook).
+        util::memset(t, 0, sizeof(Tcb));
         t->used = true;
         t->st = St::SYN_SENT;
         t->lip = ip();
@@ -541,6 +606,26 @@ void close(Handle h) {
         internal::Lock guard;
         Tcb *t = by_handle(h);
         if (!t) return;
+        if (t->st == St::LISTEN) {
+            // Listener going away: abort + free all its children (half-open
+            // and pending-accept) so no orphaned TCB pins a table slot.
+            for (int i = 0; i < MAX_CONN; i++) {
+                Tcb *c = &s_tcb[i];
+                if (!c->used || c->listener != h) continue;
+                if (c->st == St::SYN_RCVD) abort_tcb(c);
+                c->used = false;
+                c->st = St::FREE;
+                c->listener = -1;
+            }
+            t->used = false;  // passive socket: nothing in flight, just free it
+            t->st = St::FREE;
+            return;
+        }
+        if (t->st == St::SYN_RCVD) {
+            t->used = false;
+            t->st = St::FREE;
+            return;
+        }
         if (t->st == St::SYN_SENT || t->st == St::CLOSED) {
             // Never established: abort immediately, no linger.
             if (t->st == St::SYN_SENT) abort_tcb(t);
@@ -582,6 +667,111 @@ bool is_open(Handle h) {
     if (!t) return false;
     return t->st == St::EST || t->st == St::FIN_W1 || t->st == St::FIN_W2 ||
            t->st == St::CLOSE_WAIT || t->st == St::LAST_ACK;
+}
+
+Handle listen(uint32_t lip, uint16_t port, int backlog) {
+    if (!ready() || port == 0) return -1;
+    if (backlog < 1) backlog = 1;
+    if (backlog > 4) backlog = 4;  // half-open cap; table is only MAX_CONN
+    internal::Lock guard;
+    for (int i = 0; i < MAX_CONN; i++) {
+        if (s_tcb[i].used) continue;
+        Tcb *t = &s_tcb[i];
+        util::memset(t, 0, sizeof(Tcb));
+        t->used = true;
+        t->st = St::LISTEN;
+        t->lip = lip;
+        t->lport = port;
+        t->listener = -1;
+        t->backlog = backlog;
+        return i;
+    }
+    return -1;
+}
+
+Handle accept(Handle lh, uint32_t timeout_ms) {
+    uint64_t t0 = internal::now_ms();
+    for (;;) {
+        {
+            internal::Lock guard;
+            Tcb *l = by_handle(lh);
+            if (!l || l->st != St::LISTEN) return -1;
+            // Reap dead children (RST/timed-out SYN_RCVD) so they cannot
+            // pin table slots forever; only EST is returned.
+            for (int i = 0; i < MAX_CONN; i++) {
+                Tcb *c = &s_tcb[i];
+                if (!c->used || c->listener != lh) continue;
+                if (c->st == St::CLOSED || c->st == St::FREE || c->err) {
+                    c->used = false;
+                    c->st = St::FREE;
+                    c->listener = -1;
+                }
+            }
+            for (int i = 0; i < MAX_CONN; i++) {
+                Tcb *c = &s_tcb[i];
+                if (c->used && c->listener == lh && c->st == St::EST) {
+                    c->listener = -1; // consumed by accept()
+                    return i;
+                }
+            }
+        }
+        if (internal::now_ms() - t0 >= timeout_ms) return -1;
+        poll();
+        sched::sleep_ms(10);
+    }
+}
+
+// poll()/select() readiness: bytes buffered, orderly EOF, or a reset/closed
+// peer all make a read succeed/return, so the fd is "readable".
+bool readable(Handle h) {
+    internal::Lock guard;
+    Tcb *t = by_handle(h);
+    if (!t) return true;
+    return t->rx_len > 0 || t->fin_rcvd || t->err || t->st == St::CLOSED;
+}
+
+const char *st_name(St s) {
+    switch (s) {
+        case St::LISTEN: return "LISTEN";
+        case St::SYN_SENT: return "SYN-SENT";
+        case St::SYN_RCVD: return "SYN-RCVD";
+        case St::EST: return "ESTABLISHED";
+        case St::FIN_W1: return "FIN-WAIT-1";
+        case St::FIN_W2: return "FIN-WAIT-2";
+        case St::CLOSE_WAIT: return "CLOSE-WAIT";
+        case St::LAST_ACK: return "LAST-ACK";
+        case St::CLOSED: return "CLOSED";
+        default: return "-";
+    }
+}
+
+int conn_count() {
+    internal::Lock guard;
+    int n = 0;
+    for (int i = 0; i < MAX_CONN; i++)
+        if (s_tcb[i].used) n++;
+    return n;
+}
+
+bool conn_at(int i, ConnInfo &out) {
+    internal::Lock guard;
+    int seen = 0;
+    for (int k = 0; k < MAX_CONN; k++) {
+        if (!s_tcb[k].used) continue;
+        if (seen++ != i) continue;
+        const Tcb &t = s_tcb[k];
+        out.local_ip = t.lip;
+        out.remote_ip = t.rip;
+        out.local_port = t.lport;
+        out.remote_port = t.rport;
+        out.state = st_name(t.st);
+        out.rx_pending = t.rx_len;
+        out.tx_pending = t.tx_len;
+        out.open = t.st == St::EST || t.st == St::FIN_W1 || t.st == St::FIN_W2 ||
+                   t.st == St::CLOSE_WAIT || t.st == St::LAST_ACK;
+        return true;
+    }
+    return false;
 }
 
 const ConnStats &stats() { return s_stats; }

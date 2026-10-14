@@ -1,7 +1,9 @@
 // Interactive shell: line editing, history, built-in commands.
 #include <choco/console.hpp>
 #include <choco/cpu.hpp>
+#include <choco/fat32.hpp>
 #include <choco/gui.hpp>
+#include <choco/rtc.hpp>
 #include <choco/mem.hpp>
 #include <choco/mouse.hpp>
 #include <choco/net.hpp>
@@ -30,14 +32,25 @@ size_t s_hist_pos = 0;
 bool s_browsing = false;
 char s_saved[LINE_MAX]{};
 
+// Command pipeline state (Tier 2): exit status for $?, and the redirection
+// targets resolved by exec() for the command currently being dispatched.
+int s_last_status = 0;                                    // $?
+char s_rout[200];                                         // '>' / '>>' target
+bool s_has_out = false, s_rapp = false;
+char s_rin[200];                                          // '<' source
+bool s_has_in = false;
+bool s_bg = false; // the current job is backgrounded with '&'
+
 struct Counter { const char *name; volatile uint64_t n = 0; };
 Counter s_ca{"A"}, s_cb{"B"};
 
 void counter_main(void *arg) {
     auto *c = (Counter *)arg;
+    // Demo threads for the status bar: tick once, then sleep. A tight loop here
+    // burned CPU on the single core and starved the GUI renderer/cursor.
     for (;;) {
         c->n = c->n + 1;
-        if ((c->n & 0x3FFFFFULL) == 0) sched::yield(); // be nice
+        sched::sleep_ms(200);
     }
 }
 
@@ -97,10 +110,22 @@ void c_help(int, char **) {
         "  sleep <ms>           yield for N milliseconds",
         "  choco                wisdom from Choco the black cat",
         "  reboot               reboot via the 8042 controller",
-        "  ls                   list initrd files",
+        "  ls [dir]             list files (whole tree when no dir)",
         "  cat <path>           print a file",
+        "  cd [dir]             change the working directory",
+        "  pwd                  print the working directory",
+        "  mkdir <path>         create a directory",
+        "  rmdir <path>         remove a directory",
+        "  rm <path>            remove a file",
+        "  mv <src> <dst>       move/rename",
+        "  cp <src> <dst>       copy a file",
+        "  touch <path>         create an empty file",
+        "  tree [dir]           recursive listing",
+        "  df                   ram/filesystem summary",
+        "  uname                system identification",
+        "  date                 show the wall clock (RTC)",
+        "  poweroff             power off the machine (ACPI)",
         "  run <path> [args]   run a user program in ring 3",
-        "  gui                  toggle the system monitor window",
         "  mpos                 show mouse position and buttons",
         "  mclick <x> <y>       synthetic mouse click (UI testing)",
         "  wintest              synthetic drag test (moves terminal)",
@@ -113,6 +138,12 @@ void c_help(int, char **) {
         "  tcpstat              TCP counters",
         "  httpget <h> [p] [u]  HTTP/1.0 GET (needs TCP + DNS)",
         "  dns <name>           resolve A records via UDP (try 'dns example.com')",
+        "  cmd ; cmd            sequence commands",
+        "  a && b | a || b      short-circuit on exit status",
+        "  cmd > file | >> file  redirect stdout (truncate / append)",
+        "  cmd < file           redirect stdin",
+        "  a | b                pipe a's output into b (sequential)",
+        "  $?                   last exit status (e.g. 'run bin/x; echo $?')",
     };
     con::println("commands:", ACC);
     for (auto *ln : kLines) con::println(ln);
@@ -242,12 +273,6 @@ void c_reboot(int, char **) {
     con::println("rebooting...", ACC);
     cpu::outb(0x64, 0xFE); // 8042 reset (works on QEMU/real PCs)
     for (;;) { asm volatile("hlt"); }
-}
-
-void c_gui(int, char **) {
-    gui::toggle_sysmon();
-    con::kprintf(FG, BG, "sysmon window %s (right-click also toggles)\n",
-                 gui::sysmon_visible() ? "shown" : "hidden");
 }
 
 // Deterministic gesture test: synthesizes pointer motion through
@@ -422,14 +447,120 @@ void c_mpos(int, char **) {
     con::put_char('\n', FG, BG);
 }
 
-void c_ls(int, char **) {
-    if (!fs::count()) { con::println("(initrd empty: no boot module found)", ERR); return; }
+// --- flat initrd path helpers ("" == root, no leading/trailing slash) ---
+char s_cwd[200] = "";
+
+bool same_n(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+
+// True when `name` is a direct child of `base`; returns the remainder.
+const char *child_of(const char *name, const char *base) {
+    size_t bl = util::strlen(base);
+    if (!bl) return name;
+    if (util::strlen(name) <= bl + 1) return nullptr;
+    if (!same_n(name, base, bl) || name[bl] != '/') return nullptr;
+    return name + bl + 1;
+}
+
+// Resolve `arg` against the shell cwd into a canonical flat path.
+bool resolve(const char *arg, char *out, size_t cap) {
+    char work[200];
+    size_t wl = 0;
+    if (!(arg && arg[0] == '/'))
+        for (size_t i = 0; s_cwd[i] && i + 1 < sizeof(work); i++) work[wl++] = s_cwd[i];
+    work[wl] = 0;
+    const char *p = arg;
+    while (p && *p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *c = p;
+        while (*p && *p != '/') p++;
+        size_t cl = (size_t)(p - c);
+        if (cl == 1 && c[0] == '.') continue;
+        if (cl == 2 && c[0] == '.' && c[1] == '.') {
+            while (wl > 0 && work[wl - 1] != '/') wl--;
+            if (wl > 0) wl--;
+            continue;
+        }
+        if (wl + cl + 1 >= sizeof(work)) return false;
+        if (wl) work[wl++] = '/';
+        for (size_t k = 0; k < cl; k++) work[wl++] = c[k];
+    }
+    work[wl] = 0;
+    if (wl + 1 > cap) return false;
+    for (size_t k = 0; k <= wl; k++) out[k] = work[k];
+    return true;
+}
+
+bool dir_exists(const char *path) {
+    if (!*path) return true; // root
     for (size_t i = 0; i < fs::count(); i++) {
         const char *n = nullptr;
         size_t sz = 0;
-        if (fs::stat(i, &n, &sz))
-            con::kprintf(FG, BG, "  %s (%u B)\n", n, (unsigned)sz);
+        if (fs::stat(i, &n, &sz) && child_of(n, path)) return true;
     }
+    return false;
+}
+
+// Unique sub-directory names directly under `base`.
+size_t collect_dirs(const char *base, char dirs[][64], size_t maxd) {
+    size_t nd = 0;
+    for (size_t i = 0; i < fs::count(); i++) {
+        const char *n = nullptr;
+        size_t sz = 0;
+        if (!fs::stat(i, &n, &sz)) continue;
+        const char *r = child_of(n, base);
+        if (!r) continue;
+        const char *sl = r;
+        while (*sl && *sl != '/') sl++;
+        if (!*sl) continue; // a file
+        size_t len = (size_t)(sl - r);
+        if (len >= 64 || nd >= maxd) continue;
+        bool dup = false;
+        for (size_t d = 0; d < nd; d++)
+            if (util::strlen(dirs[d]) == len && same_n(dirs[d], r, len)) { dup = true; break; }
+        if (dup) continue;
+        for (size_t k = 0; k < len; k++) dirs[nd][k] = r[k];
+        dirs[nd][len] = 0;
+        nd++;
+    }
+    return nd;
+}
+
+void list_dir(const char *base) {
+    char dirs[32][64];
+    size_t nd = collect_dirs(base, dirs, 32);
+    for (size_t d = 0; d < nd; d++) con::kprintf(ACC, BG, "  %s/\n", dirs[d]);
+    for (size_t i = 0; i < fs::count(); i++) {
+        const char *n = nullptr;
+        size_t sz = 0;
+        if (!fs::stat(i, &n, &sz)) continue;
+        const char *r = child_of(n, base);
+        if (!r) continue;
+        const char *sl = r;
+        while (*sl && *sl != '/') sl++;
+        if (*sl) continue; // subdir, listed above
+        con::kprintf(FG, BG, "  %s (%u B)\n", r, (unsigned)sz);
+    }
+}
+
+void c_ls(int argc, char **argv) {
+    if (!fs::count()) { con::println("(initrd empty: no boot module found)", ERR); return; }
+    if (argc < 2) { // no argument: flat listing of the whole tree (legacy)
+        for (size_t i = 0; i < fs::count(); i++) {
+            const char *n = nullptr;
+            size_t sz = 0;
+            if (fs::stat(i, &n, &sz))
+                con::kprintf(FG, BG, "  %s (%u B)\n", n, (unsigned)sz);
+        }
+        return;
+    }
+    char p[200];
+    if (!resolve(argv[1], p, sizeof(p))) { con::println("ls: bad path", ERR); return; }
+    list_dir(p);
 }
 
 void c_cat(int argc, char **argv) {
@@ -445,10 +576,219 @@ void c_cat(int argc, char **argv) {
     if (sz && s[sz - 1] != '\n') con::put_char('\n', FG, BG);
 }
 
+void c_pwd(int, char **) { con::kprintf(FG, BG, "/%s\n", s_cwd); }
+
+void c_cd(int argc, char **argv) {
+    if (argc < 2) { s_cwd[0] = 0; return; } // cd with no arg -> root
+    char p[200];
+    if (!resolve(argv[1], p, sizeof(p))) { con::println("cd: path too long", ERR); return; }
+    if (!dir_exists(p)) {
+        con::kprintf(ERR, BG, "cd: no such directory: %s\n", argv[1]);
+        return;
+    }
+    size_t n = 0;
+    while (p[n] && n + 1 < sizeof(s_cwd)) s_cwd[n] = p[n], n++;
+    s_cwd[n] = 0;
+}
+
+void c_mkdir(int argc, char **argv) {
+    char p[200];
+    if (argc < 2 || !resolve(argv[1], p, sizeof(p)) || !*p) {
+        con::println("usage: mkdir <path>", ERR);
+        return;
+    }
+    if (!fs::writable_mkdir(p)) { con::kprintf(ERR, BG, "mkdir: failed: %s\n", argv[1]); return; }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "mkdir: %s\n", p);
+}
+
+void c_rmdir(int argc, char **argv) {
+    char p[200];
+    if (argc < 2 || !resolve(argv[1], p, sizeof(p)) || !*p) {
+        con::println("usage: rmdir <path>", ERR);
+        return;
+    }
+    if (!fs::writable_rmdir(p)) { con::kprintf(ERR, BG, "rmdir: failed: %s\n", argv[1]); return; }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "rmdir: %s\n", p);
+}
+
+void c_rm(int argc, char **argv) {
+    char p[200];
+    if (argc < 2 || !resolve(argv[1], p, sizeof(p)) || !*p) {
+        con::println("usage: rm <path>", ERR);
+        return;
+    }
+    if (!fs::writable_unlink(p)) { con::kprintf(ERR, BG, "rm: failed: %s\n", argv[1]); return; }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "rm: %s\n", p);
+}
+
+void c_mv(int argc, char **argv) {
+    char a[200], b[200];
+    if (argc < 3 || !resolve(argv[1], a, sizeof(a)) || !resolve(argv[2], b, sizeof(b)) || !*a ||
+        !*b) {
+        con::println("usage: mv <src> <dst>", ERR);
+        return;
+    }
+    if (!fs::writable_rename(a, b)) {
+        con::kprintf(ERR, BG, "mv: failed: %s -> %s\n", a, b);
+        return;
+    }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "mv: %s -> %s\n", a, b);
+}
+
+void c_cp(int argc, char **argv) {
+    char a[200], b[200];
+    if (argc < 3 || !resolve(argv[1], a, sizeof(a)) || !resolve(argv[2], b, sizeof(b)) || !*a ||
+        !*b) {
+        con::println("usage: cp <src> <dst>", ERR);
+        return;
+    }
+    const void *src = nullptr;
+    size_t sz = 0;
+    if (!fs::read(a, &src, &sz)) { con::kprintf(ERR, BG, "cp: no such file: %s\n", a); return; }
+    const uint8_t *dst = nullptr;
+    size_t cap = 0;
+    long id = fs::writable_open(b, true, true, &dst, &cap);
+    if (id < 0) { con::kprintf(ERR, BG, "cp: cannot create %s (%ld)\n", b, id); return; }
+    size_t next = 0;
+    long w = fs::writable_write(id, 0, src, sz, false, &next);
+    if (w < 0) { con::kprintf(ERR, BG, "cp: write failed (%ld)\n", w); return; }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "cp: %s -> %s (%ld bytes)\n", a, b, w);
+}
+
+void c_touch(int argc, char **argv) {
+    char p[200];
+    if (argc < 2 || !resolve(argv[1], p, sizeof(p)) || !*p) {
+        con::println("usage: touch <path>", ERR);
+        return;
+    }
+    if (fs::read(p, nullptr, nullptr)) { con::kprintf(FG, BG, "touch: %s (exists)\n", p); return; }
+    const uint8_t *d = nullptr;
+    size_t cap = 0;
+    long id = fs::writable_open(p, true, false, &d, &cap);
+    if (id < 0) { con::kprintf(ERR, BG, "touch: cannot create %s (%ld)\n", p, id); return; }
+    fs::disk_persistence_flush();
+    con::kprintf(OK, BG, "touch: %s\n", p);
+}
+
+void tree_rec(const char *base, int depth) {
+    if (depth > 8) return;
+    char dirs[32][64];
+    size_t nd = collect_dirs(base, dirs, 32);
+    for (size_t d = 0; d < nd; d++) {
+        for (int i = 0; i < depth; i++) con::print("  ", FG, BG);
+        con::kprintf(ACC, BG, "%s/\n", dirs[d]);
+        char child[200];
+        size_t n = 0;
+        for (const char *s = base; *s && n + 1 < sizeof(child); s++) child[n++] = *s;
+        if (n) child[n++] = '/';
+        for (const char *s = dirs[d]; *s && n + 1 < sizeof(child); s++) child[n++] = *s;
+        child[n] = 0;
+        tree_rec(child, depth + 1);
+    }
+    for (size_t i = 0; i < fs::count(); i++) {
+        const char *nm = nullptr;
+        size_t sz = 0;
+        if (!fs::stat(i, &nm, &sz)) continue;
+        const char *r = child_of(nm, base);
+        if (!r) continue;
+        const char *sl = r;
+        while (*sl && *sl != '/') sl++;
+        if (*sl) continue; // subdir, handled above
+        for (int k = 0; k < depth; k++) con::print("  ", FG, BG);
+        con::kprintf(FG, BG, "%s\n", r);
+    }
+}
+
+void c_tree(int argc, char **argv) {
+    char p[200];
+    if (argc < 2) {
+        size_t i = 0;
+        for (; s_cwd[i] && i + 1 < sizeof(p); i++) p[i] = s_cwd[i];
+        p[i] = 0;
+    } else if (!resolve(argv[1], p, sizeof(p))) {
+        con::println("tree: bad path", ERR);
+        return;
+    }
+    con::kprintf(ACC, BG, "/%s\n", p);
+    tree_rec(p, 1);
+}
+
+void c_df(int, char **) {
+    const uint64_t total = pmm::total_bytes() / 1048576, freeb = pmm::free_bytes() / 1048576;
+    con::kprintf(FG, BG, "ram    %llu MiB free / %llu MiB total\n", freeb, total);
+    con::kprintf(FG, BG, "heap   %u KiB mapped, %u B used\n",
+                 (unsigned)(heap::mapped_bytes() / 1024), (unsigned)heap::used_bytes());
+    con::kprintf(FG, BG, "initrd %u entries\n", (unsigned)fs::count());
+    con::kprintf(FG, BG, "disk   %s%s\n", fs::fat32::mounted() ? "mounted" : "absent",
+                 (fs::fat32::mounted() && fs::fat32::writable()) ? " (rw)" : " (ro)");
+}
+
+void c_uname(int, char **) {
+    con::println("ChocoOS 0.7 x86_64 (Limine) - ring-3 + Linux ABI");
+}
+
+void c_date(int, char **) {
+    const uint64_t e = rtc::now();
+    const int64_t days = (int64_t)(e / 86400);
+    unsigned rem = (unsigned)(e % 86400);
+    int64_t z = days + 719468; // civil_from_days (Howard Hinnant)
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = (int64_t)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    const unsigned mo = mp + (mp < 10 ? 3 : (unsigned)-9);
+    y += (mo <= 2);
+
+    char b[40];
+    uint64_t p = 0;
+    auto n4 = [&](int v) {
+        b[p++] = (char)('0' + (v / 1000) % 10);
+        b[p++] = (char)('0' + (v / 100) % 10);
+        b[p++] = (char)('0' + (v / 10) % 10);
+        b[p++] = (char)('0' + v % 10);
+    };
+    auto n2 = [&](unsigned v) {
+        b[p++] = (char)('0' + (v / 10) % 10);
+        b[p++] = (char)('0' + v % 10);
+    };
+    n4((int)y);
+    b[p++] = '-'; n2(mo);
+    b[p++] = '-'; n2(d);
+    b[p++] = ' '; n2(rem / 3600);
+    b[p++] = ':'; n2((rem / 60) % 60);
+    b[p++] = ':'; n2(rem % 60);
+    b[p] = 0;
+    con::kprintf(rtc::available() ? FG : ERR, BG, "date: %s UTC%s\n", b,
+                 rtc::available() ? "" : " (no RTC, uptime-based)");
+}
+
+void c_poweroff(int, char **) {
+    con::println("powering off...", ACC);
+    gui::poweroff(); // never returns
+}
+
 void c_run(int argc, char **argv) {
     if (argc < 2) { con::println("usage: run <path> [args...]  (try 'run bin/hello foo')", ERR); return; }
-    long code = proc::run_args(argv[1], argc - 2, &argv[2]);
-    (void)code; // run_args already reported the outcome
+    if (s_bg) { // '&': detached job; the ambient loop (gui::tick) reaps it
+        uint32_t pid = 0;
+        if (proc::spawn_job(argv[1], argc - 2, &argv[2], &pid) == 0)
+            con::kprintf(ACC, BG, "[bg] %s pid %u\n", argv[1], pid);
+        else con::println("run: cannot start background job", ERR);
+        return;
+    }
+    if (s_has_out || s_has_in)
+        proc::run_args_redir(argv[1], argc - 2, &argv[2], s_has_out ? s_rout : nullptr,
+                             s_rapp, s_has_in ? s_rin : nullptr);
+    else
+        proc::run_args(argv[1], argc - 2, &argv[2]);
 }
 
 void c_ifconfig(int, char **) {
@@ -576,15 +916,17 @@ void c_tcpstat(int, char **) {
 void c_httpget(int argc, char **argv) {
     // Kernel-side HTTP/1.0 GET over the internal TCP engine (no syscalls:
     // the syscall/socket layer in net-5 will reuse tcp::connect/send/recv).
+    // With a 4th argument the response body is written to that path too,
+    // which lets us test the full chain: TCP fetch + FAT32 write + reboot check.
     if (argc < 2) {
-        con::println("usage: httpget <host> [port] [path]  (try 'httpget 10.0.2.2 18080 /')",
+        con::println("usage: httpget <host> [port] [path] [outfile]  (try 'httpget 10.0.2.2 18080 /')",
                      ERR);
         return;
     }
     const char *host = argv[1];
     uint64_t port = 80;
     if (argc > 2 && !util::parse_uint(argv[2], port)) {
-        con::println("usage: httpget <host> [port] [path]", ERR);
+        con::println("usage: httpget <host> [port] [path] [outfile]", ERR);
         return;
     }
     const char *path = (argc > 3) ? argv[3] : "/";
@@ -592,6 +934,7 @@ void c_httpget(int argc, char **argv) {
         con::println("httpget: bad port", ERR);
         return;
     }
+    const char *outfile = (argc > 4) ? argv[4] : nullptr;
     uint32_t ip = 0;
     if (!net::parse_ipv4(host, ip)) {
         uint32_t ips[2]{};
@@ -630,6 +973,11 @@ void c_httpget(int argc, char **argv) {
     }
     uint32_t total = 0;
     bool got_status = false;
+    // Optional file receive: buffer the body and flush at the end, so a
+    // download can land on the persistent volume for the next boot to read.
+    uint8_t *file_body = nullptr;
+    uint32_t file_size = 0;
+    uint32_t file_cap = 0;
     for (;;) {
         static uint8_t buf[1024];
         int n = net::tcp::recv(h, buf, sizeof(buf), 3000);
@@ -647,13 +995,52 @@ void c_httpget(int argc, char **argv) {
             con::put_char('\n', FG, BG);
         }
         for (int i = 0; i < n; i++) con::put_char((char)buf[i], FG, BG);
-        if (total > 8192) {
+        if (outfile) {
+            if (file_size + (uint32_t)n > file_cap) {
+                uint32_t grown = file_cap ? file_cap * 2 : 4096;
+                if (grown > 256 * 1024) grown = 256 * 1024; // cap large downloads
+                uint8_t *nb = (uint8_t *)heap::realloc(file_body, grown);
+                if (!nb) { con::println("[http] out of memory", ERR); break; }
+                file_body = nb;
+                file_cap = grown;
+            }
+            if (file_size + (uint32_t)n <= file_cap) {
+                util::memcpy(file_body + file_size, buf, (size_t)n);
+                file_size += (uint32_t)n;
+            }
+        }
+        if (total > 8192 && !outfile) {
             con::println("[http] body cap reached, closing", FG);
+            break;
+        }
+        if (file_size > 256 * 1024) {
+            con::println("[http] file too large, truncated", ERR);
             break;
         }
     }
     con::kprintf(total ? OK : ERR, BG, "[http] done: %u body bytes\n", total);
     net::tcp::close(h);
+
+    if (outfile && file_body && file_size) {
+        const uint8_t *dst = nullptr;
+        size_t cap = 0;
+        long id = fs::writable_open(outfile, true, true, &dst, &cap);
+        if (id < 0) {
+            con::kprintf(ERR, BG, "[http] cannot open '%s' (%ld)\n", outfile, id);
+        } else {
+            size_t wro = 0;
+            long w = fs::writable_write(id, 0, file_body, file_size, false, &wro);
+            if (w >= 0) {
+                fs::disk_persistence_flush();
+                con::kprintf(OK, BG, "[http] saved %ld bytes -> %s\n", w, outfile);
+            } else {
+                con::kprintf(ERR, BG, "[http] write failed (%ld)\n", w);
+            }
+        }
+        heap::free(file_body);
+    } else if (file_body) {
+        heap::free(file_body);
+    }
 }
 
 void c_pci(int, char **) {
@@ -695,8 +1082,20 @@ const Cmd kCmds[] = {
     {"reboot", "reboot the machine", c_reboot},
     {"ls", "list initrd files", c_ls},
     {"cat", "print a file", c_cat},
+    {"cd", "change working directory", c_cd},
+    {"pwd", "print working directory", c_pwd},
+    {"mkdir", "create a directory", c_mkdir},
+    {"rmdir", "remove a directory", c_rmdir},
+    {"rm", "remove a file", c_rm},
+    {"mv", "move/rename a file", c_mv},
+    {"cp", "copy a file", c_cp},
+    {"touch", "create an empty file", c_touch},
+    {"tree", "recursive listing", c_tree},
+    {"df", "ram/filesystem summary", c_df},
+    {"uname", "system identification", c_uname},
+    {"date", "show the wall clock", c_date},
+    {"poweroff", "power off the machine", c_poweroff},
     {"run", "run a user program", c_run},
-    {"gui", "toggle sysmon window", c_gui},
     {"mpos", "mouse position", c_mpos},
     {"mclick", "synthetic mouse click", c_mclick},
     {"wintest", "synthetic drag test", c_wintest},
@@ -713,44 +1112,44 @@ const Cmd kCmds[] = {
 };
 
 // Try to run a program from initrd: handles "./x" and bare "x" (tries bin/x).
-bool try_run_program(int argc, char **argv) {
+// On success runs it (honouring the current redirect state) and stores the
+// child exit code in *code_out.
+bool try_run_program(int argc, char **argv, long *code_out) {
     const char *name = argv[0];
     char path[LINE_MAX];
     const void *data = nullptr;
     size_t size = 0;
+    const char *outp = s_has_out ? s_rout : nullptr;
+    const char *inp = s_has_in ? s_rin : nullptr;
+    auto run = [&](const char *p) -> bool {
+        if (!fs::read(p, &data, &size)) return false;
+        if (s_bg) { // '&': detached job, reaped by the ambient loop
+            uint32_t pid = 0;
+            if (proc::spawn_job(p, argc - 1, argv + 1, &pid) != 0) return false;
+            con::kprintf(ACC, BG, "[bg] %s pid %u\n", p, pid);
+            *code_out = 0;
+            return true;
+        }
+        *code_out = proc::run_args_redir(p, argc - 1, argv + 1, outp, s_rapp, inp);
+        return true;
+    };
 
     // Case 1: explicit path with "./" prefix -> strip "./"
     if (name[0] == '.' && name[1] == '/') {
         name += 2;
-        // Try as-is relative to initrd root (e.g. "./bin/hello" -> "bin/hello")
-        if (fs::read(name, &data, &size)) {
-            proc::run_args(name, argc - 1, argv + 1);
-            return true;
-        }
-        // Try with bin/ prefix (e.g. "./micro" -> "bin/micro")
-        size_t i = 0;
+        if (run(name)) return true; // e.g. "./bin/hello" -> "bin/hello"
+        size_t i = 0;               // ... otherwise try bin/<name>
         const char *prefix = "bin/";
         while (*prefix && i < LINE_MAX - 1) path[i++] = *prefix++;
         const char *p = name;
         while (*p && i < LINE_MAX - 1) path[i++] = *p++;
         path[i] = 0;
-        if (fs::read(path, &data, &size)) {
-            proc::run_args(path, argc - 1, argv + 1);
-            return true;
-        }
-        return false;
+        return run(path);
     }
 
     // Case 2: explicit path containing '/' (e.g. bin/hello) -> run as-is
-    for (const char *p = name; *p; p++) {
-        if (*p == '/') {
-            if (fs::read(name, &data, &size)) {
-                proc::run_args(name, argc - 1, argv + 1);
-                return true;
-            }
-            return false;
-        }
-    }
+    for (const char *p = name; *p; p++)
+        if (*p == '/') return run(name);
 
     // Case 3: bare name (e.g. "micro") -> try bin/<name>
     size_t i = 0;
@@ -759,29 +1158,265 @@ bool try_run_program(int argc, char **argv) {
     const char *p = name;
     while (*p && i < LINE_MAX - 1) path[i++] = *p++;
     path[i] = 0;
-    if (fs::read(path, &data, &size)) {
-        proc::run_args(path, argc - 1, argv + 1);
-        return true;
+    return run(path);
+}
+
+// --- Tier 2: tokenizer, quoting, ';' / '&&' / '||' and redirection ---
+
+constexpr int T_WORD = 0, T_SEMI = 1, T_AND = 2, T_OR = 3;
+constexpr int T_BG = 8; // lone '&': background the job (T_GT..T_PIPE use 4..7)
+constexpr int T_GT = 4, T_GTGT = 5, T_LT = 6, T_PIPE = 7;
+
+struct Tok {
+    char *s;
+    int op;
+};
+
+size_t emit_status(char *d) { // expands $? into d; returns its length
+    char t[16];
+    int v = s_last_status < 0 ? 0 : s_last_status;
+    int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) {
+        t[n++] = (char)('0' + v % 10);
+        v /= 10;
     }
-    return false;
+    for (int i = 0; i < n; i++) d[i] = t[n - 1 - i];
+    return (size_t)n;
+}
+
+// Expands $? in a word at execution time (empty the status is that of the
+// previous command). Returns the word itself when it has no $?.
+char *expand_word(char *w) {
+    bool has = false;
+    for (char *p = w; p[0]; p++)
+        if (p[0] == '$' && p[1] == '?') { has = true; break; }
+    if (!has) return w;
+    static char pool[8][256];
+    static int idx = 0;
+    char *b = pool[idx];
+    idx = (idx + 1) & 7;
+    size_t o = 0;
+    for (char *p = w; p[0] && o + 4 < 256;) {
+        if (p[0] == '$' && p[1] == '?') { o += emit_status(b + o); p += 2; }
+        else b[o++] = *p++;
+    }
+    b[o] = 0;
+    return b;
+}
+
+size_t tokenize(char *s, Tok *out, size_t max) {
+    // Words are copied into a scratch area (not the input line): in-place
+    // NUL-termination would clobber the delimiter the scanner still needs.
+    static char wbuf[1024];
+    size_t wn = 0;
+    size_t n = 0;
+    char *p = s;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char c = *p;
+        if (c == ';') { out[n].s = p; out[n++].op = T_SEMI; p++; continue; }
+        if (c == '&') {
+            if (p[1] == '&') { out[n].s = p; out[n++].op = T_AND; p += 2; }
+            else { out[n].s = p; out[n++].op = T_BG; p++; } // lone '&' -> background
+            continue;
+        }
+        if (c == '|') {
+            if (p[1] == '|') { out[n].s = p; out[n++].op = T_OR; p += 2; }
+            else { out[n].s = p; out[n++].op = T_PIPE; p++; }
+            continue;
+        }
+        if (c == '>') {
+            if (p[1] == '>') { out[n].s = p; out[n++].op = T_GTGT; p += 2; }
+            else { out[n].s = p; out[n++].op = T_GT; p++; }
+            continue;
+        }
+        if (c == '<') { out[n].s = p; out[n++].op = T_LT; p++; continue; }
+        // word: supports '..' literal and ".." (with \escapes); $? stays literal
+        char *w = &wbuf[wn];
+        bool sq = false, dq = false;
+        while (*p) {
+            char ch = *p;
+            if (sq) {
+                if (ch == '\'') { sq = false; p++; continue; }
+                if (wn + 1 < sizeof(wbuf)) wbuf[wn++] = ch;
+                p++;
+                continue;
+            }
+            if (dq) {
+                if (ch == '"') { dq = false; p++; continue; }
+                if (ch == '\\' && p[1]) { if (wn + 1 < sizeof(wbuf)) wbuf[wn++] = p[1]; p += 2; continue; }
+                if (wn + 1 < sizeof(wbuf)) wbuf[wn++] = ch;
+                p++;
+                continue;
+            }
+            if (ch == '\'') { sq = true; p++; continue; }
+            if (ch == '"') { dq = true; p++; continue; }
+            if (ch == '\\' && p[1]) { if (wn + 1 < sizeof(wbuf)) wbuf[wn++] = p[1]; p += 2; continue; }
+            if (ch == ' ' || ch == '\t' || ch == ';' || ch == '&' || ch == '|' || ch == '>' ||
+                ch == '<')
+                break;
+            if (wn + 1 < sizeof(wbuf)) wbuf[wn++] = ch;
+            p++;
+        }
+        if (wn + 1 < sizeof(wbuf)) wbuf[wn++] = 0; // terminator
+        out[n].s = w;
+        out[n++].op = T_WORD;
+    }
+    return n;
+}
+
+bool write_all(const char *path, const char *data, size_t len, bool append) {
+    if (!path || !*path) return false;
+    const uint8_t *d = nullptr; // path is already resolved by the caller
+    size_t size = 0;
+    long id = fs::writable_open(path, true, !append, &d, &size);
+    if (id < 0) return false;
+    size_t off = append ? size : 0;
+    size_t next = off;
+    long w = fs::writable_write(id, off, data, len, false, &next);
+    if (w < 0) return false;
+    fs::disk_persistence_flush();
+    return true;
+}
+
+// Dispatch one command: builtins capture their console output when '>' is
+// active; 'run' and programs use run_args_redir instead (they spawn a job).
+int run_one(int argc, char **argv, bool background) {
+    s_bg = background; // consulted by try_run_program / c_run to detach the job
+    for (auto &c : kCmds) {
+        if (!util::strcmp(argv[0], c.name)) {
+            if (s_has_out && util::strcmp(argv[0], "run") != 0) {
+                constexpr size_t CAP = 4096;
+                char *buf = (char *)heap::alloc(CAP);
+                if (!buf) { c.fn(argc, argv); return 0; }
+                console::set_capture(buf, CAP);
+                c.fn(argc, argv);
+                size_t len = console::capture_end();
+                if (!write_all(s_rout, buf, len, s_rapp))
+                    con::kprintf(ERR, BG, "redirection: cannot write %s\n", s_rout);
+                heap::free(buf);
+            } else {
+                c.fn(argc, argv);
+            }
+            return 0;
+        }
+    }
+    long code = 0;
+    if (try_run_program(argc, argv, &code)) return (int)code;
+    con::kprintf(ERR, BG, "unknown command '%s' (try 'help' or 'ls')\n", argv[0]);
+    return 127;
+}
+
+void copy_str(char *dst, const char *src, size_t cap) {
+    size_t n = 0;
+    while (src[n] && n + 1 < cap) dst[n] = src[n], n++;
+    dst[n] = 0;
+}
+
+void make_temp(char *dst, int seq) {
+    size_t n = 0;
+    dst[n++] = '.';
+    dst[n++] = 'p';
+    char t[12];
+    int m = 0;
+    if (seq == 0) t[m++] = '0';
+    while (seq) { t[m++] = (char)('0' + seq % 10); seq /= 10; }
+    for (int k = 0; k < m; k++) dst[n++] = t[m - 1 - k];
+    dst[n] = 0;
+}
+
+// Runs the pipeline starting at i (segments delimited by '|') up to the next
+// job connector (';' / '&&' / '||'). Pipe segments are chained through scratch
+// files, so piping is *sequential*: the producer must finish before the
+// consumer starts. That covers finite streams and needs no multi-process
+// change to the single-foreground process model. Returns the last segment's
+// exit status.
+int run_pipeline(Tok *toks, size_t ntok, size_t &i, bool run, int &seq) {
+    char inpath[200];
+    inpath[0] = 0;
+    bool have_in = false;
+    int status = s_last_status;
+    char temps[8][32];
+    int ntemp = 0;
+    for (;;) {
+        char *argv[ARGS_MAX];
+        int argc = 0;
+        char rout[200];
+        bool has_out = false, app = false;
+        char rin[200];
+        bool has_in = false;
+        while (i < ntok && toks[i].op != T_PIPE && toks[i].op != T_SEMI && toks[i].op != T_AND &&
+               toks[i].op != T_OR && toks[i].op != T_BG) {
+            if (toks[i].op == T_WORD) {
+                if (argc < (int)ARGS_MAX) argv[argc++] = expand_word(toks[i].s);
+                i++;
+            } else if (toks[i].op == T_GT || toks[i].op == T_GTGT || toks[i].op == T_LT) {
+                const int op = toks[i].op;
+                i++;
+                if (i < ntok && toks[i].op == T_WORD) {
+                    if (op == T_LT) { resolve(toks[i].s, rin, sizeof(rin)); has_in = true; }
+                    else { resolve(toks[i].s, rout, sizeof(rout)); has_out = true; app = (op == T_GTGT); }
+                    i++;
+                } else {
+                    con::println("syntax error: missing redirection target", ERR);
+                }
+            } else {
+                i++;
+            }
+        }
+        const bool more = (i < ntok && toks[i].op == T_PIPE);
+        const bool bg = (i < ntok && toks[i].op == T_BG);
+        char outres[200];
+        outres[0] = 0;
+        if (more) {
+            char tname[32];
+            make_temp(tname, ++seq);
+            resolve(tname, outres, sizeof(outres)); // resolved once; reused as-is
+            if (ntemp < 8) copy_str(temps[ntemp++], outres, sizeof(temps[0]));
+        }
+        if (run) {
+            s_has_out = false; s_rapp = false; s_has_in = false;
+            if (more) { copy_str(s_rout, outres, sizeof(s_rout)); s_has_out = true; s_rapp = false; }
+            else if (has_out) { copy_str(s_rout, rout, sizeof(s_rout)); s_has_out = true; s_rapp = app; }
+            if (has_in) { copy_str(s_rin, rin, sizeof(s_rin)); s_has_in = true; }
+            else if (have_in) { copy_str(s_rin, inpath, sizeof(s_rin)); s_has_in = true; }
+            if (argc > 0) status = run_one(argc, argv, bg);
+            s_last_status = status;
+        }
+        if (more) {
+            copy_str(inpath, outres, sizeof(inpath));
+            have_in = true;
+            i++; // consume '|'
+            continue;
+        }
+        break;
+    }
+    if (run)
+        for (int t = 0; t < ntemp; t++) fs::writable_unlink(temps[t]);
+    return status;
 }
 
 void exec(char *line) {
-    char *argv[ARGS_MAX];
-    size_t argc = 0;
-    for (char *p = line; *p && argc < ARGS_MAX;) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        argv[argc++] = p;
-        while (*p && *p != ' ') p++;
-        if (*p) *p++ = 0;
+    static Tok toks[64];
+    size_t ntok = tokenize(line, toks, 64);
+    if (!ntok) return;
+    size_t i = 0;
+    int pending = T_SEMI; // first job runs unconditionally
+    static int pipe_seq = 0;
+    while (i < ntok) {
+        const bool do_run = (pending == T_SEMI) || (pending == T_AND && s_last_status == 0) ||
+                            (pending == T_OR && s_last_status != 0);
+        s_last_status = run_pipeline(toks, ntok, i, do_run, pipe_seq);
+        if (i < ntok) {
+            pending = toks[i].op; // T_SEMI / T_AND / T_OR / T_BG
+            if (pending == T_BG) pending = T_SEMI; // the background job ends the item
+            i++;
+        } else {
+            break;
+        }
     }
-    if (!argc) return;
-    for (auto &c : kCmds)
-        if (!util::strcmp(argv[0], c.name)) { c.fn((int)argc, argv); return; }
-    // Fallback: try to run as user program (bin/<name>, ./name, or path)
-    if (try_run_program((int)argc, argv)) return;
-    con::kprintf(ERR, BG, "unknown command '%s' (try 'help' or 'ls')\n", argv[0]);
 }
 
 void handle_key(char c) {
@@ -864,7 +1499,7 @@ void run() {
         }
         uint64_t s = pit::seconds();
         if (s != last_sec) { last_sec = s; status_bar(); }
-        gui::tick(); // mouse gestures, 1 Hz sysmon/taskbar, repaint
+        gui::tick(); // mouse gestures, 1 Hz clock, shortcut rescan, repaint
         asm volatile("hlt"); // sleep until the next IRQ
     }
 }

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Comment=Browse the initrd, /disk and the writable root
+Exec=bin/fileman
+Icon=file-explorer
+OnlyShowIn=Desktop;StartMenu;Taskbar;

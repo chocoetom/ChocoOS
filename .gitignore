@@ -1,0 +1,11 @@
+build/
+iso_root/
+kernel/gen/
+*.iso
+*.elf
+_deps/
+.vscode/.cmake/
+CMakeCache.txt
+Python/
+/*.log
+/qemu_debug.log

@@ -228,6 +228,22 @@ int socket_count() {
     return n;
 }
 
+bool sock_at(int i, SockInfo &out) {
+    internal::Lock guard;
+    int seen = 0;
+    for (int k = 0; k < MAX_SOCK; k++) {
+        if (!s_sock[k].used) continue;
+        if (seen++ != i) continue;
+        out.port = s_sock[k].port;
+        out.has_dgram = s_sock[k].has_pkt;
+        out.dgram_len = s_sock[k].pkt_len;
+        out.from_ip = s_sock[k].from_ip;
+        out.from_port = s_sock[k].from_port;
+        return true;
+    }
+    return false;
+}
+
 const SockStats &stats() { return s_stats; }
 
 }  // namespace choco::net::udp

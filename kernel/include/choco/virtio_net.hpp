@@ -44,6 +44,8 @@ void reset(NetDevice *net);
 int recv_packet(NetDevice *net, void *buf, uint32_t max_len);
 int send_packet(NetDevice *net, const void *buf, uint32_t len);
 bool link_status(NetDevice *net);
+// Re-read the link bit from device config (set_link changes it live).
+void refresh_link(NetDevice *net);
 uint16_t get_mtu(NetDevice *net);
 const uint8_t *get_mac(NetDevice *net);
 

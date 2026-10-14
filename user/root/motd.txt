@@ -1,0 +1,9 @@
+Welcome to ChocoOS!
+
+This file lives in the initrd (initrd.tar, first boot module).
+Try in the shell:
+  ls            - list initrd files
+  cat motd.txt  - print this file
+  run bin/hello - run the first user-space program in ring 3
+
+Choco the black cat supervises all threads personally.

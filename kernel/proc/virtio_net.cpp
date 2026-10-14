@@ -220,6 +220,18 @@ int send_packet(NetDevice *net, const void *buf, uint32_t len) {
     if (!net || !buf || len == 0) return -1;
     if (len + s_hdr_sz > TX_BUF_SZ) return -1;
     if (!s_tx_virt) return -1;
+    // Link down: the backend is gone and a kick can stall the vCPU inside
+    // QEMU (observed on Windows builds). Fail fast and bounded instead.
+    NetConfig *cfg = (NetConfig *)net->vdev.device_cfg;
+    if (cfg && (net->vdev.driver_features & VIRTIO_NET_F_STATUS) && !(cfg->status & 1)) {
+        net->link_up = false;
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            console::kprintf(FG, BG, "[virtio-net] link down: TX skipped (bounded)\n");
+        }
+        return -1;
+    }
     util::memset(s_tx_virt, 0, s_hdr_sz);
     util::memcpy(s_tx_virt + s_hdr_sz, buf, len);
     virtio::Device *vdev = &net->vdev;
@@ -257,6 +269,13 @@ int send_packet(NetDevice *net, const void *buf, uint32_t len) {
 }
 
 bool link_status(NetDevice *net) { return net && net->link_up; }
+void refresh_link(NetDevice *net) {
+    if (!net) return;
+    if (net->vdev.driver_features & VIRTIO_NET_F_STATUS) {
+        NetConfig *cfg = (NetConfig *)net->vdev.device_cfg;
+        net->link_up = (cfg->status & 1) != 0;
+    }
+}
 uint16_t get_mtu(NetDevice *net) { return net ? net->mtu : 1500; }
 const uint8_t *get_mac(NetDevice *net) { return net ? net->mac : nullptr; }
 
